@@ -1,0 +1,128 @@
+goldAI
+├── goldAI_env 
+│                    
+├── .env 
+│                   
+├── elso.py     # Primary execution script
+│   ├── all the imports
+│   │
+│   ├── def setup_mt5 # To set up mt5
+│   │
+│   ├── if setup_mt5 # Usage example
+│   │
+│   ├── def setup_logging
+│   │
+│   ├── class Config
+│   │   ├── SYMBOL: str = "GOLD"
+│   │   ├── ACCOUNT_BALANCE: float = Field(10000.0, gt=0)
+│   │   ├── RISK_PER_TRADE: float = Field(0.02, gt=0, le=0.05)
+│   │   ├── INITIAL_STOP_LOSS: float = Field(100, gt=5, le=500)
+│   │   ├── INITIAL_TAKE_PROFIT: float = 150
+│   │   ├── MAX_TRADES_PER_DAY: int = Field(default=20, gt=0, le=100)
+│   │   ├── FEATURES: List[str] = ['open', 'high', 'low', 'close', 'real_volume']
+│   │   ├── MODEL_VERSION: str = "1.0"
+│   │   ├── ATR_STOP_LOSS_FACTOR: float = Field(default=1.5, gt=0.0, le=5.0)
+│   │   ├── TRAILING_STOP_POINTS: int = Field(default=50, gt=0, le=500)
+│   │   ├── PREPROCESSOR_PATH: Path = Path("models/preprocessor.pkl")
+│   │   ├── DATA_POINTS: int = 500
+│   │   ├── RL_MODEL_PATH: Path = Path("models/rl_model")
+│   │   ├── MAX_DATA_BUFFER: int = 2000
+│   │   ├── TRADE_PENALTY_THRESHOLD: float = -50
+│   │   ├── POSITION_ADJUSTMENT_THRESHOLD: float = 100
+│   │   ├── RETRAIN_INTERVAL_DAYS: int = 7
+│   │   ├── MIN_RETRAIN_SAMPLES: int = 1000
+│   │   ├── TIMEFRAME: int = mt5.TIMEFRAME_M1
+│   │   ├── RL_PARAMS: ClassVar[Dict] =
+│   │   │   ├── 'learning_rate': 3e-4,
+│   │   │   ├── 'n_steps': 2048,
+│   │   │   ├── 'batch_size': 64,
+│   │   │   ├── 'n_epochs': 10,
+│   │   │   ├── 'gamma': 0.99,
+│   │   │   ├── 'gae_lambda': 0.95,
+│   │   │   ├── 'clip_range': 0.2,
+│   │   │   ├── 'ent_coef': 0.01,
+│   │   │   └── 'total_timesteps': 100000
+│   │   │ 
+│   │   ├── model_config = 
+│   │   │   ├── "arbitrary_types_allowed": True,
+│   │   │   └── "validate_assignment": True
+│   │   │ 
+│   │   ├── @field_validator('SYMBOL')
+│   │   ├── @classmethod
+│   │   ├── def validate_symbol(cls, v: str) -> str:
+│   │   │ 
+│   │   ├── @field_validator('TIMEFRAME')
+│   │   ├── @classmethod
+│   │   ├── def validate_timeframe(cls, v: int) -> int:
+│   │   │ 
+│   │   ├── @field_validator('PREPROCESSOR_PATH', 'RL_MODEL_PATH')
+│   │   ├── @classmethod
+│   │   ├── def validate_paths(cls, v: Path) -> Path:
+│   │   │ 
+│   │   ├── @field_validator('INITIAL_STOP_LOSS')
+│   │   ├── @classmethod
+│   │   ├── def validate_stop_loss(cls, v: float, info: FieldValidationInfo) -> float:
+│   │   │ 
+│   │   ├── @model_validator(mode='after')
+│   │   ├── def validate_risk_reward(self) -> 'Config':
+│   │   │ 
+│   │   └── def __str__(self) -> str:
+│   │
+│   ├── class PerformanceMonitor:
+│   │   ├── def __init__(self):
+│   │   ├── def _update_sharpe(self):
+│   │   ├── def _update_equity_curve(self, pnl):
+│   │   ├── def _update_drawdown(self):
+│   │   ├── def _calc_annualized_return(self):
+│   │   ├── def _calc_profit_factor(self):
+│   │   ├── def get_performance_report(self):
+│   │   ├── def plot_equity_curve(self):
+│   │   └── def update(self, trade):
+│   │ 
+│   ├── class MT5Connector:
+│   │   ├── def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
+│   │   ├── def _ensure_connection(self) -> bool:
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   ├── 
+│   │
+│   └── predictor.py
+│                    
+├──
+├── strategies/
+│   ├── scalping_engine.py       # Core strategy
+│   └── ml_model/
+│       ├── feature_eng.py
+│       ├── model.py
+│       └── predictor.py
+├── utilities/
+│   ├── logger.py
+│   ├── analytics.py
+│   ├── error_handler.py
+│   └── heartbeat.py           # NEW: System health monitoring
+└── tests/
+    ├── unit/
+    └── stress/                # NEW: Extreme scenario tests
