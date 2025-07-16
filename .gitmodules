@@ -1,0 +1,3 @@
+[submodule "Gold_AI_trading_bot"]
+	path = Gold_AI_trading_bot
+	url = https://github.com/QuantAlpha1/Gold_AI_trading_bot.git
