@@ -1,16 +1,97 @@
-goldAI
-├── goldAI_env 
+Gold_AI_Trading_bot 
 │                    
 ├── .env 
 │                   
-├── elso.py     # Primary execution script
-│   ├── all the imports
+├── main.py     # Primary execution script
+│   ├── SYSTEM & OS
+│   │   ├── import sys
+│   │   ├── import argparse
+│   │   ├── from pathlib import Path
+│   │   ├── import warnings
+│   │   ├── import threading
+│   │   ├── from threading import Lock
+│   │   ├── from collections import defaultdict
+│   │   ├── from dataclasses import dataclass
+│   │   ├── import time
+│   │   ├── import re
+│   │   ╰── import copy
 │   │
-│   ├── def setup_mt5 # To set up mt5
+│   ├── LOGGING
+│   │   ├── import logging
+│   │   ╰── from logging.handlers import TimedRotatingFileHandler
 │   │
-│   ├── if setup_mt5 # Usage example
+│   ├── DATA & MATH
+│   │   ├── import numpy as np
+│   │   ├── import numpy.typing as npt
+│   │   ├── from numpy.typing import ArrayLike, NDArray
+│   │   ├── import pandas as pd
+│   │   ├── import math
+│   │   ╰── from decimal import Decimal, getcontext, getcontext().prec = 8
+│   │
+│   ├── DATETIME
+│   │   ├── from datetime import datetime, timedelta
+│   │   ╰── import pytz
+│   │
+│   ├── METATRADER
+│   │   ╰── import MetaTrader5 as mt5
+│   │
+│   ├── MACHINE LEARNING
+│   │   ├── from sklearn.preprocessing import RobustScaler
+│   │   ├── from sklearn.metrics import accuracy_score
+│   │   ├── from sklearn.inspection import permutation_importance
+│   │   ├── from sklearn.inspection import permutation_importance
+│   │   ├── from sklearn.model_selection import TimeSeriesSplit
+│   │   ├── import joblib
+│   │   ├── import shap
+│   │   ├── from lime.lime_tabular import LimeTabularExplainer
+│   │   ├── import matplotlib.pyplot as plt
+│   │   ╰── from matplotlib.figure import Figure
+│   │  
+│   ├── REINFORCEMENT LEARNING
+│   │   ├── import gymnasium as gym
+│   │   ├── from gymnasium import spaces, Env
+│   │   ├── from stable_baselines3 import PPO
+│   │   ├── from stable_baselines3.common.env_util import make_vec_env
+│   │   ├── from stable_baselines3.common.vec_env import DummyVecEnv
+│   │   ├── from stable_baselines3.common.callbacks import BaseCallback
+│   │   ├── from datetime import datetime, timedelta
+│   │   ├── from collections import deque
+│   │   ╰── import hashlib
+│   │  
+│   ├── STATISTICS
+│   │   ╰── from statsmodels.stats.diagnostic import breaks_cusumolsresid
+│   │  
+│   ├── TYPING
+│   │   ├── from typing import (Tuple, Dict, Callable, TypedDict, Optional, List, Any, Union, Literal, ClassVar)
+│   │   ├── from typing_extensions import Annotated
+│   │   ├── from typing import TYPE_CHECKING, Any
+│   │   ╰── from typing_extensions import Annotated
+│   │ 
+│   ├── VALIDATION
+│   │   ╰── from pydantic import:
+│   │       ├── BaseModel
+│   │       ├── Field
+│   │       ├── field validator
+│   │       ├── model validatior
+│   │       ├── ValidationInfo
+│   │       ╰── ConfigDict
+│   │ 
+│   ├── UTILITIES
+│   │   ├── import random
+│   │   ├── from functools import lru_cache
+│   │   ╰── from apscheduler.schedulers.background import BackgroundScheduler
+│   │ 
+│   ├── def detect_clustering
+│   │
+│   ├── def mt5_get
 │   │
 │   ├── def setup_logging
+│   │
+│   ├── class TradingError(Exception)
+│   │ 
+│   ├── class RetryableError(TradingError)
+│   │
+│   ├── def _execute_with_retry_core
 │   │
 │   ├── class Config
 │   │   ├── SYMBOL: str = "GOLD"
@@ -41,7 +122,7 @@ goldAI
 │   │   │   ├── 'gae_lambda': 0.95,
 │   │   │   ├── 'clip_range': 0.2,
 │   │   │   ├── 'ent_coef': 0.01,
-│   │   │   └── 'total_timesteps': 100000
+│   │   │   ╰──  'total_timesteps': 100000
 │   │   │ 
 │   │   ├── model_config = 
 │   │   │   ├── "arbitrary_types_allowed": True,
@@ -82,7 +163,7 @@ goldAI
 │   ├── class MT5Connector:
 │   │   ├── def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
 │   │   ├── def _ensure_connection(self) -> bool:
-│   │
+│   │   
 │   ├── 
 │   │
 │   ├── 

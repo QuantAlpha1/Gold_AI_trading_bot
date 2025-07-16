@@ -1,16 +1,9 @@
 
-
-"This is an AI-driven intraday bot for Gold that combines machine learning with traditional technical analysis. "
-"It trades short-term trends but exits quickly if volatility spikes or the market reverses. "
-"The system prioritizes capital preservation with strict risk limits, making it suitable for moderate-risk traders."
-
-
-
 # Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 # To create the environment: python -m venv goldAI_env
 # goldAI_env\Scripts\activate
 
-# IP Protection: File patents for core algorithms (like BOTS Inc.’s Bitcoin ATM patents) to prevent replication 12.
+
 
 #!/usr/bin/env python3
 """GoldAI - MetaTrader 5 Gold Trading Bot with Machine Learning with Stable Baselines3 (PPO) for RL"""
@@ -56,7 +49,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.model_selection import TimeSeriesSplit
 import joblib
 import shap
-import lime
+from lime.lime_tabular import LimeTabularExplainer
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
@@ -68,11 +61,11 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 from datetime import datetime, timedelta
-import deque
+from collections import deque
 import hashlib
 
 # ===================== STATISTICS =====================
-from statsmodels.tsa.statespace.tools import cusum_squares
+from statsmodels.stats.diagnostic import breaks_cusumolsresid
 
 # ===================== TYPING =====================
 from typing import (
@@ -80,7 +73,10 @@ from typing import (
     List, Any, Union, Literal, ClassVar
 )
 from typing_extensions import Annotated
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from typing_extensions import Annotated
+
 
 # ===================== VALIDATION =====================
 from pydantic import (
@@ -101,12 +97,32 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pytest
 from elso import MT5Wrapper
 
-
+if TYPE_CHECKING:
+    # Type stub for LIME Explanation when type checking
+    class LimeExplanation:
+        as_list: Callable[..., List[Tuple[str, float]]]
+        show_in_notebook: Callable[..., None]
+        local_exp: Dict[int, List[Tuple[int, float]]]
+        # Add other methods you use
+        
+    LimeExplanationResult = LimeExplanation
 
 
 def detect_clustering(trades: List[float]) -> bool:
-    test = cusum_squares(np.diff(trades))
-    return test.pvalue < 0.01
+    """Detects structural breaks in trade sequences using CUSUM of squares test."""
+    diff_trades = np.diff(trades)
+    _, p_values, _ = breaks_cusumolsresid(diff_trades)
+    
+    # Convert array of p-values to a single boolean (True if ANY break is significant)
+    return bool(np.any(p_values < 0.01))  # Explicitly cast to bool
+
+"""
+If you need the test statistics for further analysis, modify the return statement:
+python
+
+test_stat, p_value, _ = breaks_cusumolsresid(diff_trades)
+return test_stat, p_value < 0.01
+"""
 
 
 ObsType = npt.NDArray[np.float32]
@@ -3159,9 +3175,7 @@ class GoldMLModel:
             data_fetcher=self.data_fetcher
         )
 
-        self._last_sync_version = ""  # Initialize sync version tracker
-        self._model_hash = ""         # Track model state separately
-        self._preprocessor_hash = ""  # Track preprocessor state separately
+        self.last_model_update = datetime.now()
 
         self.last_base_signal = None  # Track last base signal 
 
@@ -3722,9 +3736,9 @@ class GoldMLModel:
             feature_names=self._get_feature_names()
         )
 
-    def explain_prediction_lime(self, X_sample: np.ndarray) -> lime.lime_tabular.Explanation:
+    def explain_prediction_lime(self, X_sample: np.ndarray) -> 'LimeExplanationResult':
         """Explain prediction using LIME"""
-        explainer = lime.lime_tabular.LimeTabularExplainer(
+        explainer = LimeTabularExplainer(
             training_data=self._get_background_data().reshape(-1, self.preprocessor.window_size, len(self.preprocessor.features)),
             feature_names=self._get_feature_names(),
             mode="classification"
@@ -5106,7 +5120,52 @@ class RiskManager:
             logger.info(f"Resetting daily counts (was {self.today_trades} trades)")
         self.today_trades = 0
 
-    
+    def validate_trade_params(self, symbol: str, price: float, sl: float, tp: float) -> Tuple[bool, str]:
+        """Bulletproof trade validation with proper None handling"""
+        # Get market data with explicit checks
+        try:
+            spread = self.data_fetcher.get_current_spread(symbol)
+            atr = self.data_fetcher.get_daily_atr(symbol)
+            current_price = self.data_fetcher.get_current_price(symbol)
+            
+            # Explicit None checks
+            if spread is None:
+                return False, "Could not determine current spread"
+            if atr is None:
+                return False, "Could not calculate ATR"
+            if current_price is None or 'bid' not in current_price or 'ask' not in current_price:
+                return False, "Invalid current price data"
+
+            # Convert to float with validation
+            try:
+                bid = float(current_price['bid'])
+                ask = float(current_price['ask'])
+                spread = float(spread)
+                atr = float(atr)
+            except (TypeError, ValueError) as e:
+                return False, f"Invalid numeric data: {str(e)}"
+
+            # Core validation rules (now safe from None errors)
+            checks = [
+                (price > 0, "Price must be positive"),
+                ((price > sl and sl > 0) or (price < sl), "Invalid stop loss position"),
+                ((tp > price > sl) or (tp < price < sl), "Invalid take profit position"),
+                (abs(price - sl) > spread * 3, f"SL too close (needs > {spread*3:.2f} spread)"),
+                (abs(tp - price) > spread * 3, f"TP too close (needs > {spread*3:.2f} spread)"),
+                (abs(price - sl) <= atr * 2, f"SL too wide (max {atr*2:.2f} ATR)"),
+                (abs(tp - price) >= abs(price - sl) * 1.5, "Risk/reward ratio < 1.5"),
+                (bid * 0.99 <= price <= ask * 1.01, "Price deviated >1% from current market")
+            ]
+            
+            for condition, message in checks:
+                if not condition:
+                    return False, message
+                    
+            return True, "Valid parameters"
+            
+        except Exception as e:
+            logger.error(f"Trade validation crashed: {str(e)}")
+            return False, "Validation error"
 
     def _execute_with_retry(self, func: Callable, *args, **kwargs) -> Any:
         """Execute a function with retry logic"""
@@ -5210,6 +5269,10 @@ class TradingBot:
         self.preprocessor = preprocessor  # Use the injected preprocessor instead of creating new
         self.mt5_wrapper = mt5_wrapper 
         self.data_fetcher = data_fetcher
+
+        self._meta_learner = None
+        if config.ENABLE_META_LEARNING:
+            self._init_meta_learning()  # Now manages ALL meta-learning
         
         # Initialize ML model with meta-learning
         self.ml_model = GoldMLModel(
@@ -5507,7 +5570,7 @@ class TradingBot:
             print("Connection unavailable for trading")
             return False
         
-        # 3. NEW: Get market context for meta-learning
+        # 1. Get market context for meta-learning
         if hasattr(self, 'meta_learner') and self.meta_learner:
             market_data = self.data_fetcher.get_last_n_candles(
                 symbol=Config.SYMBOL,
@@ -5517,11 +5580,11 @@ class TradingBot:
             if market_data is not None:
                 self.meta_learner.update_market_state(market_data)
 
-        # Validate signal
+        # 2. Validate signal
         if signal not in [-1, 0, 1]:
             return False
             
-        # 5. Trade type determination (modified)
+        # 3. Trade type determination (modified)
         trade_type = "buy" if signal == 1 else ("sell" if signal == -1 else None)
         if trade_type is None:
             return False
@@ -5574,15 +5637,43 @@ class TradingBot:
                 Config.SYMBOL, stop_loss_pips
             )
 
-            # NOW we can use it for order book impact calculation
+            # ===== ADD VALIDATION HERE =====
+            is_valid, reason = self.risk_manager.validate_trade_params(
+                symbol=Config.SYMBOL,
+                price=requested_price,
+                sl=sl_price,
+                tp=tp_price
+            )
+            if not is_valid:
+                logger.warning(
+                    f"🚨 Trade rejected: {reason}\n"
+                    f"Requested: {requested_price:.5f}\n"
+                    f"SL: {sl_price:.5f} | TP: {tp_price:.5f}\n"
+                    f"Spread: {self.data_fetcher.get_current_spread(Config.SYMBOL):.2f}pips"
+                )
+                self.performance_monitor.update({
+                    'type': 'rejection',
+                    'symbol': Config.SYMBOL,
+                    'price': requested_price,
+                    'reason': reason,
+                    'signal': signal,
+                    'time': datetime.now()
+                })
+                return False
+            # ===== END VALIDATION BLOCK =====
+
+            # Calculate impact but don't use it for execution
             order_book = OrderBookSimulator()
-            impact = order_book.get_impact(aggressive_size)  # Use aggressive_size instead of undefined volume
-        
-
-            # Calculate adjusted price with impact
+            impact = order_book.get_impact(aggressive_size)
             adjusted_price = current_price_value * (1 + impact) if trade_type == 'buy' else current_price_value * (1 - impact)
+            
+            # Log the impact for analysis
+            self.performance_monitor.update({
+                'order_book_impact': impact,
+                'adjusted_price': adjusted_price,
+                'raw_price': current_price_value,
+            })
 
-            # Add to _execute_aggressive_trade(), before self.mt5.send_order()
             if not self.risk_manager.check_margin_requirements(
                 symbol=Config.SYMBOL,
                 volume=aggressive_size,
@@ -5591,6 +5682,8 @@ class TradingBot:
             ):
                 logger.error(f"Insufficient margin for {aggressive_size} lots")
                 return False
+
+            
 
             # 6. Trade Execution
             result = self.mt5.send_order(
@@ -5678,17 +5771,8 @@ class TradingBot:
                     'action': trade_type,
                     'entry_price': cost_basis,
                     'exit_price': fill_price,
-                    'pnl': pnl,
-                    'slippage': slippage,
-                    'stop_loss_pips': stop_loss_pips,
-                    'time': datetime.now()
-                })
-
-                
-                self.performance_monitor.update({
-                    'action': trade_type,
-                    'entry_price': cost_basis,
-                    'exit_price': fill_price,
+                    'price_prediction_error': abs(fill_price - adjusted_price),
+                    'actual_execution_price': fill_price,
                     'pnl': pnl,
                     'slippage': slippage,
                     'stop_loss_pips': stop_loss_pips,
@@ -5716,34 +5800,63 @@ class TradingBot:
             
     
     def _update_data_buffer(self, new_data: pd.DataFrame) -> None:
-        """Update the data buffer with new samples"""
+        """Update data buffer with robust validation and monitoring.
         
-        try:
-            # Existing buffer update logic...
-            new_samples = new_data[~new_data.index.isin(
-                [x.index[0] for x in self.data_buffer if len(x) > 0]
-            )]
+        Args:
+            new_data: DataFrame with datetime index and market data
             
-            if len(new_samples) > 0:
+        Raises:
+            TypeError: If input isn't a DataFrame
+            ValueError: If empty or malformed data
+        """
+        # Validate input
+        if not isinstance(new_data, pd.DataFrame):
+            raise TypeError(f"Expected DataFrame, got {type(new_data)}")
+        if new_data.empty:
+            raise ValueError("Empty data received")
+        if not isinstance(new_data.index, pd.DatetimeIndex):
+            raise ValueError("DataFrame must have datetime index")
+
+        try:
+            # Get existing indices efficiently
+            existing_indices = (
+                pd.concat(self.data_buffer).index 
+                if self.data_buffer 
+                else pd.DatetimeIndex([])
+            )
+            
+            # Vectorized filtering
+            new_samples = new_data[~new_data.index.isin(existing_indices)]
+            
+            if not new_samples.empty:
+                # Validate new samples
+                required_cols = {'open', 'high', 'low', 'close'}
+                if not required_cols.issubset(new_samples.columns):
+                    raise ValueError(f"Missing required columns: {required_cols - set(new_samples.columns)}")
+                
+                # Update buffer
                 self.data_buffer.append(new_samples)
                 
+                # Enforce size limit
                 if len(self.data_buffer) > self.max_buffer_size:
                     self.data_buffer = self.data_buffer[-self.max_buffer_size:]
                 
-                # Add buffer monitoring HERE (after successful update)
+                # Monitor update
                 self.performance_monitor.update({
                     'buffer_size': len(self.data_buffer),
                     'buffer_capacity': self.max_buffer_size,
-                    'new_samples': len(new_samples)
+                    'new_samples': len(new_samples),
+                    'timestamp': datetime.now().isoformat()
                 })
                 
         except Exception as e:
-            logger.error(f"Buffer update failed: {str(e)}")
-            # Update monitor with error state
+            logger.error(f"Buffer update failed: {str(e)}", exc_info=True)
             self.performance_monitor.update({
                 'buffer_error': str(e),
-                'buffer_size': len(self.data_buffer)  # Last known size
+                'buffer_size': len(self.data_buffer),
+                'status': 'error'
             })
+            raise  # Re-raise for calling code to handle
     
     def _check_retraining(self):
         """Check if retraining is needed and execute it"""
