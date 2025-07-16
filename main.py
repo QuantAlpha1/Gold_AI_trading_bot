@@ -3,13 +3,19 @@
 # To create the environment: python -m venv goldAI_env
 # goldAI_env\Scripts\activate
 
-
+# Legal protection:
+# Add a LICENCE file
+# Include Terms of Use in README.md
 
 #!/usr/bin/env python3
 """GoldAI - MetaTrader 5 Gold Trading Bot with Machine Learning with Stable Baselines3 (PPO) for RL"""
 
 # ===================== SYSTEM & OS =====================
 import sys
+import os
+api_key = os.getenv('MT5_API_KEY') # Not changed anywhere else yet!
+from cryptography.fernet import Fernet
+key = Fernet.generate_key()  # Store this securely, not implemented further yet
 import argparse
 from pathlib import Path
 import warnings
@@ -323,6 +329,11 @@ class TradePair:
     entry: float
     exit: float
 
+# New, needs to be addded to the tree
+class TradeSignal(BaseModel):
+    symbol: Annotated[str, "GOLD"]
+    entry: float
+    stop_loss: float
 
 class MT5Wrapper:
     """Safe wrapper for all MT5 operations with type hints"""
@@ -703,7 +714,6 @@ class Config(BaseModel):
     USE_ATR_SIZING: bool = True  # Dynamic SL enabled by default
     MIN_STOP_DISTANCE: float = 50  # Fallback if ATR too small (pips)
     ATR_STOP_LOSS_FACTOR: float = Field(default=1.5, gt=0.0, le=5.0)
-    TRAILING_STOP_POINTS: int = Field(default=50, gt=0, le=500)
     PREPROCESSOR_PATH: Path = Path("models/preprocessor.pkl")
     DATA_POINTS: int = 500
     RL_MODEL_PATH: Path = Field(default=Path("models/rl_model"))
@@ -1636,6 +1646,7 @@ class IndicatorUtils:
         return 0.0  # Unknown format
 
 
+
 class MT5Connector:
     def __init__(self, max_retries: int = 3, retry_delay: float = 1.0, 
                 data_fetcher: Optional['DataFetcher'] = None):
@@ -1662,11 +1673,33 @@ class MT5Connector:
                 finally:
                     self._reset_connection_state()
 
-    def _execute_with_retry(self, func: Callable, *args, **kwargs) -> Any:
+    def _execute_with_retry(
+        self,
+        func: Callable[..., Any],
+        *args,
+        max_retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+        **kwargs
+    ) -> Any:
+        """Execute a function with retry logic for MT5 operations.
+        
+        Args:
+            func: The function to execute
+            *args: Positional arguments for the function
+            max_retries: Maximum retry attempts (default: self.max_retries)
+            retry_delay: Delay between retries in seconds (default: self.retry_delay)
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            The result of the function if successful
+            
+        Raises:
+            Exception: If all retries fail
+        """
         return _execute_with_retry_core(
             func=func,
-            max_retries=self.max_retries,
-            retry_delay=self.retry_delay,
+            max_retries=max_retries or self.max_retries,
+            retry_delay=retry_delay or self.retry_delay,
             success_retcode=MT5Wrapper.TRADE_RETCODE_DONE,
             *args,
             ensure_connected=self.ensure_connected,
@@ -1860,29 +1893,50 @@ class MT5Connector:
         print(f"Order failed after retries. Last retcode: {getattr(result, 'retcode', 'UNKNOWN')}")
         return None
     
-    def modify_position(self, ticket: int, new_sl: float, new_tp: float) -> bool:
-        """Modify stop loss and take profit of an existing position with retry logic"""
+    def modify_position(self, ticket: int, sl: float, tp: float) -> bool:
+        """Modify stop loss and take profit of an existing position with retry logic
+        
+        Args:
+            ticket: Position ticket ID
+            sl: New stop loss price
+            tp: New take profit price
+        
+        Returns:
+            bool: True if modification succeeded, False otherwise
+        """
         def _prepare_and_modify() -> Optional[Dict]:
+            """Inner function preparing MT5 request with validation"""
             positions = MT5Wrapper.positions_get(ticket=ticket)
             if not positions:
-                print(f"Position {ticket} not found")
+                print(f"[ERROR] Position {ticket} not found")
                 return None
                 
             request = {
                 "action": mt5.TRADE_ACTION_SLTP,
                 "position": ticket,
-                "sl": new_sl,
-                "tp": new_tp,
-                "magic": 123456,
+                "sl": sl,
+                "tp": tp,
+                "magic": 123456,  # Your exact magic number
             }
             
             return MT5Wrapper.order_send(request)
         
-        result = self._execute_with_retry(_prepare_and_modify)
-        if result and hasattr(result, 'retcode') and result.retcode == mt5.TRADE_RETCODE_DONE:
-            return True
+        # Your exact retry logic with all original parameters
+        result = self._execute_with_retry(
+            func=_prepare_and_modify,
+            max_retries=self.max_retries,
+            retry_delay=self.retry_delay,
+            success_retcode=MT5Wrapper.TRADE_RETCODE_DONE,
+            ensure_connected=self.ensure_connected,
+            on_success=lambda: setattr(self, 'last_activity_time', time.time()),
+            on_exception=self._reset_connection_state
+        )
         
-        print(f"Modify position failed after retries. Last retcode: {getattr(result, 'retcode', 'UNKNOWN')}")
+        if result and hasattr(result, 'retcode'):
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"[SUCCESS] Modified position {ticket} | SL: {sl:.5f} | TP: {tp:.5f}")
+                return True
+            print(f"[FAILED] Modify position {ticket} failed. Retcode: {result.retcode}")
         return False
     
     def close_position(self, ticket: int, volume: float) -> bool:
@@ -5694,6 +5748,36 @@ class TradingBot:
                 tp=tp_price,
                 comment=f"AGGR-{trade_type.upper()}-ATR{stop_loss_pips:.0f}"
             )
+
+            # After successful trade execution (around line 137 in your current code)
+            if result and result.get('retcode') == mt5.TRADE_RETCODE_DONE:
+                ticket = int(result.get('order', 0)) or int(result.get('ticket', 0))
+                
+                # 1. Immediate trailing stop setup
+                position = self.mt5.get_position(ticket)
+                if position:
+                    # Set initial ATR-based stop
+                    self._update_trailing_stop(position)
+                    
+                    # 2. Special handling for aggressive trades
+                    if signal in [-2, 2]:  # Your extra-aggressive signals
+                        atr = self.data_fetcher.get_daily_atr(Config.SYMBOL)
+                        if atr:
+                            # Tighter stop for aggressive trades (2.5x ATR instead of 3x)
+                            tighter_sl = (position['price_open'] - (2.5 * atr)) if position['type'] == 'buy' else (position['price_open'] + (2.5 * atr))
+                            self.mt5.modify_position(
+                                ticket=position['ticket'],
+                                sl=tighter_sl,
+                                tp=position['tp']
+                            )
+                
+                # 3. Add to aggressive trades monitoring
+                self._activate_aggressive_trades({
+                    'ticket': ticket,
+                    'symbol': Config.SYMBOL,
+                    'entry_time': datetime.now(),
+                    'initial_sl': position['sl'] if position else None
+                })
             
             # 7. Execution Verification with proper dictionary access
             if not result or not isinstance(result, dict) or result.get('retcode') != mt5.TRADE_RETCODE_DONE:
@@ -5934,6 +6018,32 @@ class TradingBot:
             logger.debug("Position changes detected - clearing cache")
             self.risk_manager.clear_position_cache()
 
+    def _activate_aggressive_trades(self, position: Dict):
+        """Special handling for high-conviction trades"""
+        atr = self.data_fetcher.get_daily_atr(position['symbol'])
+        if not atr:
+            return
+            
+        # Tighter stops for aggressive trades
+        multiplier = 2.5  # vs normal 3x ATR
+        if position['type'] == 'buy':
+            new_sl = position['price_open'] - (multiplier * atr)
+        else:
+            new_sl = position['price_open'] + (multiplier * atr)
+        
+        # Move TP closer as well (optional)
+        tp_adjustment = 1.5  # 1.5x ATR profit target
+        if position['type'] == 'buy':
+            new_tp = position['price_open'] + (tp_adjustment * atr)
+        else:
+            new_tp = position['price_open'] - (tp_adjustment * atr)
+        
+        self.mt5.modify_position(
+            ticket=position['ticket'],
+            sl=new_sl,
+            tp=new_tp
+        )
+
     def _add_to_position(self, position: Dict, current_price: Dict):
         """Add to winning position"""
         # Calculate additional position size (half of initial)
@@ -5982,8 +6092,8 @@ class TradingBot:
             if float(position['price_current']) >= breakeven_price:
                 return self.mt5.modify_position(
                     position['ticket'],
-                    new_sl=breakeven_price,
-                    new_tp=float(position['tp'])  # Keep original TP
+                    sl=breakeven_price,
+                    tp=float(position['tp'])  # Keep original TP
                 )
             else:
                 return self.mt5.close_position(position['ticket'], close_volume)
@@ -5992,19 +6102,45 @@ class TradingBot:
             logger.error(f"Position handling failed: {str(e)}")
             return False
     
-    def _update_trailing_stop(self, position: Dict, current_price: Dict, profit_pips: float):
-        """Update trailing stop loss"""
-        if profit_pips < Config.TRAILING_STOP_POINTS:
-            return
+    def _update_trailing_stop(self, position: Dict) -> bool:
+        """ATR-based trailing stop with internal data fetching"""
+        symbol = position['symbol']
+        
+        # 1. Get required market data
+        current_price = self.data_fetcher.get_current_price(symbol)
+        if not current_price:
+            print(f"[WARN] No price data for {symbol}")
+            return False
             
+        atr = self._get_current_atr(symbol)  # Use your existing cache-aware method
+        if atr is None:
+            print(f"[WARN] No ATR data for {symbol}")
+            return False
+        
+        # 2. Calculate new stop
+        new_sl: float
+        modified = False
+        
         if position['type'] == 'buy':
-            new_sl = current_price['bid'] - (Config.TRAILING_STOP_POINTS * 0.1)
-            if new_sl > position['sl']:
-                self.mt5.modify_position(position['ticket'], new_sl, position['tp'])
+            new_sl = current_price['bid'] - (3 * atr)
+            if new_sl > position['sl']:  # Only move stop up
+                modified = self.mt5.modify_position(
+                    ticket=position['ticket'],
+                    sl=new_sl,
+                    tp=position['tp']
+                )
         else:
-            new_sl = current_price['ask'] + (Config.TRAILING_STOP_POINTS * 0.1)
-            if new_sl < position['sl'] or position['sl'] == 0:
-                self.mt5.modify_position(position['ticket'], new_sl, position['tp'])
+            new_sl = current_price['ask'] + (3 * atr)
+            if new_sl < position['sl'] or position['sl'] == 0:  # Only move stop down
+                modified = self.mt5.modify_position(
+                    ticket=position['ticket'],
+                    sl=new_sl,
+                    tp=position['tp']
+                )
+        
+        if modified:
+            print(f"[INFO] Updated trailing stop for {symbol} to {new_sl:.5f}")
+        return modified
 
     def show_performance(self, periodic: bool = False):
         """Display performance metrics and equity curve"""
@@ -6155,6 +6291,26 @@ class TradingBot:
         self.risk_manager.emergency_stop.activate()
         self._close_all_positions()
 
+    def _get_current_atr(self, symbol: str) -> Optional[float]:
+        """Get cached ATR value with fallback to fresh calculation
+        
+        Args:
+            symbol: Trading symbol (e.g., 'GOLD')
+            
+        Returns:
+            Current ATR value or None if unavailable
+        """
+        # Try cache first
+        cache_key = f"atr_{symbol}_14"
+        if cache_key in self.data_fetcher._atr_cache:
+            value, timestamp = self.data_fetcher._atr_cache[cache_key]
+            if (datetime.now() - timestamp).total_seconds() < 300:  # 5 min cache
+                return value
+        
+        # Fallback to fresh calculation
+        return self.data_fetcher.get_daily_atr(symbol, period=14)
+
+    
 
 class Backtester:
     """
@@ -6816,6 +6972,22 @@ class EmergencyStop:
             return (f"EmergencyStop(ACTIVE since {status['since']}, "
                     f"reason: {status['reason']}{timeout_info})")
         return "EmergencyStop(INACTIVE)"
+
+# Needs to be added: # In your trading cycle:
+"""
+for position in active_positions:
+    self._update_trailing_stop(position)
+"""
+
+
+
+"""
+In main loop:
+python
+
+# Run every 60 seconds
+self._update_all_trailing_stops()
+"""
 
 
 if __name__ == "__main__":
