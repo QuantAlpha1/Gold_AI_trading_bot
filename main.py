@@ -335,6 +335,7 @@ class TradeSignal(BaseModel):
     entry: float
     stop_loss: float
 
+
 class MT5Wrapper:
     """Safe wrapper for all MT5 operations with type hints"""
     
@@ -1044,7 +1045,7 @@ class PerformanceMonitor:
             self._update_sharpe()
             self._update_drawdown()
 
-    def get_performance_report(self) -> Dict[str, Any]:
+    def get_performance_report(self, model: Optional["GoldMLModel"] = None) -> Dict[str, Any]:
         """Generate comprehensive performance report with warnings and enhanced metrics"""
         with self._metrics_lock:
             trades = list(self.metrics['trades'])
@@ -1100,7 +1101,8 @@ class PerformanceMonitor:
         if trade_stats['profit_factor'] < 1.0:
             warnings.append("WARNING: Profit factor below 1.0 - strategy is losing money")
 
-        return {
+        # Build report dictionary
+        report = {
             # Core metrics
             'annualized_return': f"{annualized_return:.2f}%",
             'sharpe_ratio': f"{metrics_snapshot['sharpe']:.2f}" if metrics_snapshot['sharpe'] is not None else "N/A",
@@ -1132,11 +1134,20 @@ class PerformanceMonitor:
             'warnings': warnings if warnings else ["No critical issues detected"],
             'status': "DANGER" if warnings else "OK",
             
-            
             # Model performance (if available)
             'model_accuracy': getattr(self, 'model_accuracy', "N/A"),
-            'last_retrain': getattr(self, 'last_retrain_time', "Never")
+            'last_retrain': getattr(self, 'last_retrain_time', "Never"),
         }
+
+        # Add model-specific information if provided
+        if model is not None:
+            model_info = {
+                '_version': getattr(model, '_version', 'N/A'),
+                'model_metrics': model.calculate_metrics() if hasattr(model, 'calculate_metrics') else {}
+            }
+            report.update(model_info)
+
+        return report
 
     def plot_equity_curve(self):
         """Generate matplotlib equity curve plot"""
@@ -2214,6 +2225,7 @@ class DataFetcher:
             'historical': 300,  # 5 minutes for historical data
             'volatility': 300   # 5 minutes for volatility
         }
+        self.timeframe = MT5Wrapper.TIMEFRAME_H1
 
     
     def _parse_timeframe(self, tf: Union[int, str]) -> int:
@@ -2328,12 +2340,22 @@ class DataFetcher:
             self._cache[cache_key] = df
         return df
     
-    def get_volatility(self, symbol: str, period: int = 14) -> float:
-        """Get normalized volatility score (0-1) with thread-safe caching"""
+    def get_volatility(self, symbol: str, period: int = 14, lookback_periods: Optional[int] = None) -> float:
+        """Get normalized volatility score (0-1) with thread-safe caching.
+        
+        Args:
+            symbol: Trading symbol (e.g., 'XAUUSD')
+            period: ATR period (default: 14)
+            lookback_periods: Optional override for historical volatility calculation
+            
+        Returns:
+            Normalized volatility score (0-1) where 1 = maximum volatility
+        """
         with self._cache_lock:
-            # Standardized cache keys
-            vol_cache_key = f"vol_{symbol}_{period}"
-            atr_cache_key = f"atr_{symbol}_{period}"
+            # Determine cache keys based on parameters
+            period_to_use = lookback_periods if lookback_periods is not None else period
+            vol_cache_key = f"vol_{symbol}_{period_to_use}"
+            atr_cache_key = f"atr_{symbol}_{period_to_use}"
             
             # Check cache first
             if vol_cache_key in self._volatility_cache:
@@ -2346,11 +2368,17 @@ class DataFetcher:
                             return cached_vol
 
             try:
-                # Get fresh ATR value with explicit float conversion
-                atr_value = self.get_daily_atr(symbol, period)
+                # Get fresh ATR value - use appropriate method
+                atr_value = (
+                    self.get_historical_atr(symbol, lookback_periods) 
+                    if lookback_periods 
+                    else self.get_daily_atr(symbol, period)
+                )
+                
+                # Early return if ATR is None
                 if atr_value is None:
                     logger.debug(f"No ATR value for {symbol}, using neutral fallback")
-                    return 0.5  # Neutral fallback
+                    return 0.5
 
                 # Get current price for normalization
                 tick = self.get_current_price(symbol)
@@ -2358,23 +2386,19 @@ class DataFetcher:
                     logger.debug(f"No valid tick data for {symbol}, using neutral fallback")
                     return 0.5
 
-                # Ensure price is float with proper error handling
+                # Price validation
                 try:
                     price = float(tick['ask'])
-                    if not isinstance(price, float) or price <= 0:
-                        raise ValueError("Invalid price value")
+                    if price <= 0:
+                        raise ValueError("Price must be positive")
                 except (TypeError, ValueError) as e:
-                    logger.warning(f"Invalid price for {symbol}: {tick['ask']} - {str(e)}")
+                    logger.warning(f"Invalid price for {symbol}: {tick.get('ask')} - {str(e)}")
                     return 0.5
 
-                # Calculate normalized volatility (0-1 scale)
-                try:
-                    normalized_vol = min(1.0, atr_value / (price * 0.01))  # Cap at 1% of price
-                except ZeroDivisionError:
-                    logger.warning(f"Zero price encountered for {symbol}, using neutral fallback")
-                    return 0.5
+                # Normalize volatility (now safe from None values)
+                normalized_vol = min(1.0, atr_value / (price * 0.01))  # Cap at 1% of price
 
-                # Apply symbol-specific settings from config
+                # Apply symbol-specific multipliers
                 try:
                     symbol_type = 'gold' if 'gold' in symbol.lower() else 'default'
                     multiplier = self.config.VOLATILITY_SETTINGS.get(
@@ -2383,18 +2407,18 @@ class DataFetcher:
                     )['multiplier']
                     final_vol = min(1.0, normalized_vol * multiplier)
                 except (AttributeError, KeyError) as e:
-                    logger.warning(f"Volatility config error for {symbol}: {str(e)}")
-                    final_vol = normalized_vol  # Use unadjusted value if config fails
+                    logger.warning(f"Volatility config error: {str(e)}")
+                    final_vol = normalized_vol
 
-                # Update caches with consistent keys and explicit types
+                # Update caches
                 self._volatility_cache[vol_cache_key] = final_vol
                 self._atr_cache[atr_cache_key] = (float(atr_value), datetime.now())
 
                 return final_vol
 
             except Exception as e:
-                logger.error(f"Volatility calculation failed for {symbol}: {str(e)}", exc_info=True)
-                return 0.5  # Fallback neutral value
+                logger.error(f"Volatility calculation failed: {str(e)}", exc_info=True)
+                return 0.5
             
     def _fetch_historical_data(self, symbol: str, timeframe: int, num_candles: int) -> Optional[pd.DataFrame]:
         """Actual MT5 historical data fetching using MT5Wrapper instance"""
@@ -2645,6 +2669,47 @@ class DataFetcher:
         
         return df
     
+    def get_historical_atr(self, symbol: str, periods: int, timeframe: Optional[int] = None) -> Optional[float]:
+        """Calculate ATR from historical data
+        
+        Args:
+            symbol: Trading symbol
+            periods: Number of periods for ATR calculation
+            timeframe: MT5 timeframe constant (optional, uses instance default if None)
+        """
+        try:
+            tf = timeframe if timeframe is not None else self.timeframe
+            data = self.get_historical_data(
+                symbol=symbol,
+                timeframe=tf,
+                num_candles=periods + 1  # Need one extra candle for calculation
+            )
+            if data is None or len(data) < periods:
+                return None
+            return self._calculate_atr(data, periods)
+        except Exception as e:
+            logger.error(f"Historical ATR calculation failed: {str(e)}")
+            return None
+
+    def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> float:
+        """Core ATR calculation from DataFrame"""
+        try:
+            high = data['high']
+            low = data['low']
+            close = data['close']
+            
+            # Calculate True Range
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            
+            # Calculate ATR
+            atr = true_range.rolling(window=period).mean().iloc[-1]
+            return float(atr)
+        except Exception as e:
+            logger.error(f"ATR calculation error: {str(e)}")
+            return 0.0
 
 
 class DataPreprocessor:
@@ -3578,6 +3643,23 @@ class GoldMLModel:
             logger.error(f"Model retraining failed: {str(e)}", exc_info=True)
             return False
         
+    def should_retrain_based_on_performance(self, threshold: float = 50.0) -> bool:
+        """Determine if retraining is needed based on performance metrics.
+        
+        Args:
+            threshold: Win rate percentage below which we retrain (default: 50%)
+            
+        Returns:
+            bool: True if retraining is recommended
+        """
+        metrics = self.calculate_metrics()
+        if metrics is None:
+            return False
+            
+        return (metrics['win_rate'] < threshold or 
+                metrics['sharpe_ratio'] < 1.0 or
+                metrics['max_drawdown'] > metrics['total_return'] * 0.5)
+
     def _verify_model_architecture(self) -> bool:
         """Verify model architecture matches config expectations"""
         try:
@@ -4461,6 +4543,69 @@ class GoldMLModel:
             logger.error(f"Preprocessor validation failed: {str(e)}")
             return False
 
+    def refresh_model(self) -> bool:
+        """Reload model and verify integrity"""
+        if not self.config.RL_MODEL_PATH.exists():
+            logger.error("No model file to refresh")
+            return False
+            
+        try:
+            self.model = PPO.load(self.config.RL_MODEL_PATH)
+            return self.validate_model()
+        except Exception as e:
+            logger.error(f"Refresh failed: {str(e)}")
+            return False
+
+    def calculate_metrics(self) -> Dict[str, float]:
+        """Calculate performance metrics from the model's trade history.
+        
+        Returns:
+            dict: Metrics including Sharpe ratio, max drawdown, win rate, total return.
+                Returns empty dict if no trades exist.
+        """
+        if not hasattr(self, 'trade_history') or not self.trade_history:
+            return {
+                'sharpe_ratio': 0.0,
+                'max_drawdown': 0.0,
+                'win_rate': 0.0,
+                'total_return': 0.0,
+                'avg_trade_duration_hours': 0.0,
+                'n_trades': 0
+            }
+
+        returns = np.array([trade['profit'] for trade in self.trade_history])
+        cumulative_returns = np.cumsum(returns)
+        
+        # Sharpe Ratio (annualized)
+        sharpe_ratio = np.mean(returns) / (np.std(returns) + 1e-10) * np.sqrt(252)
+        
+        # Max Drawdown
+        peak = np.maximum.accumulate(cumulative_returns)
+        drawdowns = peak - cumulative_returns
+        max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0.0
+        
+        # Win Rate
+        win_rate = np.sum(returns > 0) / len(returns) * 100
+        
+        # Total Return
+        total_return = np.sum(returns)
+        
+        # Additional metrics useful for trading bots
+        avg_trade_duration = np.mean([
+            (trade['exit_time'] - trade['entry_time']).total_seconds() / 3600 
+            for trade in self.trade_history 
+            if 'exit_time' in trade and 'entry_time' in trade
+        ]) if len(self.trade_history) > 0 else 0
+        
+        return {
+            'sharpe_ratio': float(round(sharpe_ratio, 2)),
+            'max_drawdown': float(round(max_drawdown, 2)),
+            'win_rate': float(round(win_rate, 1)),
+            'total_return': float(round(total_return, 2)),
+            'avg_trade_duration_hours': float(round(avg_trade_duration, 1)),
+            'n_trades': int(len(self.trade_history))
+        }
+    
 
 class ModelPerformanceTracker:
     def __init__(self, model: Optional['GoldMLModel'] = None):
@@ -5342,6 +5487,7 @@ class TradingBot:
 
         # Now that ml_model exists, add it to monitor
         self.performance_monitor.add_model(self.ml_model)
+
         
         # Initialize data buffer
         self.data_buffer = []
@@ -6310,6 +6456,9 @@ class TradingBot:
         # Fallback to fresh calculation
         return self.data_fetcher.get_daily_atr(symbol, period=14)
 
+    def reload_model(self) -> bool:
+        """Public interface for model refresh"""
+        return self.ml_model.refresh_model()
     
 
 class Backtester:
@@ -7140,45 +7289,93 @@ if __name__ == "__main__":
                 
                 # Main trading loop
                 while True:
-                    # Run one iteration of the trading logic
-                    bot.run()
-                    
-                    # Check for retraining every N trades
-                    if trade_count % 50 == 0:  # Check every 50 trades
-                        new_data = data_fetcher.get_historical_data(
-                            symbol=config.SYMBOL,
-                            timeframe=config.TIMEFRAME,
-                            num_candles=config.MIN_RETRAIN_SAMPLES
-                        )
+                    try:
+                        # Run one iteration of the trading logic
+                        bot.run()
                         
-                        if new_data is not None and len(new_data) >= config.MIN_RETRAIN_SAMPLES:
-                            if bot.ml_model.should_retrain(len(new_data)):
-                                logger.info("Initiating automatic retraining...")
-                                if bot.ml_model.retrain_model(new_data):
-                                    logger.info("Retraining completed successfully")
+                        # Check for retraining every N trades (e.g., every 50 trades)
+                        if trade_count % 50 == 0:  
+                            # First check if we have enough new data
+                            new_data = data_fetcher.get_historical_data(
+                                symbol=config.SYMBOL,
+                                timeframe=config.TIMEFRAME,
+                                num_candles=config.MIN_RETRAIN_SAMPLES * 2  # Get extra data buffer
+                            )
+                            
+                            if new_data is not None and len(new_data) >= config.MIN_RETRAIN_SAMPLES:
+                                # Calculate current metrics for logging (regardless of retraining decision)
+                                current_metrics = bot.ml_model.calculate_metrics()
+                                logger.debug(f"Current performance metrics: {current_metrics}")
+                                
+                                # Check both conditions: data freshness AND performance metrics
+                                data_condition = bot.ml_model.should_retrain(len(new_data))
+                                performance_condition = bot.ml_model.should_retrain_based_on_performance()
+                                
+                                if data_condition and performance_condition:
+                                    logger.info("Performance-based retraining triggered...")
+                                    logger.info(f"Triggering metrics: {current_metrics}")
+                                    
+                                    try:
+                                        # Data preprocessing
+                                        new_data = new_data.drop_duplicates().sort_index()
+                                        new_data = new_data[~new_data.index.duplicated(keep='last')]
+                                        
+                                        # Execute retraining
+                                        if bot.ml_model.retrain_model(new_data):
+                                            logger.info("Retraining completed successfully")
+                                            
+                                            # Model reload and validation
+                                            if bot.reload_model():
+                                                new_metrics = bot.ml_model.calculate_metrics()
+                                                logger.info(f"Post-retraining improvement: "
+                                                        f"Sharpe: {current_metrics['sharpe_ratio']:.2f}→{new_metrics['sharpe_ratio']:.2f} "
+                                                        f"Win%: {current_metrics['win_rate']:.1f}→{new_metrics['win_rate']:.1f}")
+                                            else:
+                                                logger.warning("Model reload failed after retraining")
+                                        else:
+                                            logger.warning("Retraining failed - keeping previous model")
+                                            
+                                    except Exception as e:
+                                        logger.error(f"Retraining error: {str(e)}", exc_info=True)
+                                        # Attempt to continue trading with previous model
                                 else:
-                                    logger.warning("Retraining failed")
-                    
-                    # Increment and check trade count
-                    trade_count += 1
-                    if trade_count % 100 == 0:
-                        print(f"\nCompleted {trade_count} trades - Generating performance report...")
-                        bot.show_performance(periodic=True)
+                                    logger.debug(f"Retraining conditions not met - "
+                                            f"Data: {'✓' if data_condition else '✗'} "
+                                            f"Performance: {'✓' if performance_condition else '✗'}")
+                            else:
+                                logger.debug(f"Insufficient new data for retraining - "
+                                        f"Has: {len(new_data) if new_data is not None else 0}/"
+                                        f"Needed: {config.MIN_RETRAIN_SAMPLES}")
                         
-                    time.sleep(0.1)
-                    
+                        # Increment trade count
+                        trade_count += 1
+                        
+                        # Periodic reporting
+                        if trade_count % 100 == 0:
+                            print(f"\nCompleted {trade_count} trades")
+                            bot.show_performance(include_metrics=True)
+                            
+                        # Adaptive sleep based on market volatility
+                        sleep_duration = max(0.1, min(1.0, 1.0 - data_fetcher.get_volatility(
+                            symbol=config.SYMBOL,
+                            lookback_periods=20
+                        ) * 0.1))
+                        
+                    except Exception as e:
+                        logger.error(f"Error in trading loop iteration: {str(e)}", exc_info=True)
+                        if not mt5_connector.ensure_connected():
+                            logger.error("Failed to reconnect to MT5 - retrying in 10 seconds")
+                            time.sleep(10)
+                        
             except KeyboardInterrupt:
                 print("\nShutting down...")
-                # Final performance report
                 print("\n=== FINAL PERFORMANCE REPORT ===")
-                bot.show_performance()
+                bot.show_performance(include_metrics=True)
+            except Exception as e:
+                logger.critical(f"Fatal error in trading bot: {str(e)}", exc_info=True)
             finally:
                 bot.mt5.disconnect()
-
-    except Exception as e:
-        logger.error(f"Initialization failed: {str(e)}")
-        sys.exit(1)
-
+                logger.info("MT5 connection closed")
 
 """J  
 Licensing Fee Models
