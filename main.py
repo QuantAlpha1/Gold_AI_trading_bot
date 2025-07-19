@@ -782,6 +782,48 @@ class Config(BaseModel):
         description="Volatility calibration parameters by symbol type"
     )
 
+    VOLATILITY_CLOSE_THRESHOLD: float = Field(
+        default=30.0,
+        gt=0,
+        le=100,
+        description="Close positions when volatility index exceeds this value"
+    )
+
+    ATR_SPIKE_MULTIPLIER: float = Field(
+        default=3.0,
+        gt=1.0,
+        le=5.0,
+        description="Close positions when current ATR > baseline ATR * this multiplier"
+    )
+
+    RSI_PARTIAL_CLOSE_MIN: float = Field(
+        default=30.0,
+        gt=0,
+        lt=50,
+        description="Only partial close when RSI below this value"
+    )
+
+    RSI_PARTIAL_CLOSE_MAX: float = Field(
+        default=70.0,
+        gt=50,
+        lt=100,
+        description="Only partial close when RSI above this value"
+    )
+
+    RSI_PYRAMIDING_MIN: float = Field(
+        default=45.0,
+        gt=30,
+        lt=50,
+        description="Minimum RSI for adding to positions"
+    )
+
+    RSI_PYRAMIDING_MAX: float = Field(
+        default=55.0,
+        gt=50,
+        lt=70,
+        description="Maximum RSI for adding to positions"
+    )
+
     COMMISSION: float = Field(default=0.0005, gt=0, le=0.01, 
                             description="Broker commission per trade (0.05%)")
     SLIPPAGE_MODEL: Dict[str, Dict[str, float]] = Field(
@@ -6384,44 +6426,86 @@ class TradingBot:
         )
 
     def _handle_losing_position(self, position: Dict) -> bool:
-        """Handle losing positions with volatility checks and partial closing"""
-        # 1. First check volatility if available
+        """Handle losing positions with comprehensive volatility checks and smart closing logic"""
         try:
-            if hasattr(self.data_fetcher, 'get_volatility_index'):
-                vol_idx = self.data_fetcher.get_volatility_index(position['symbol'])
-                if vol_idx > 30:  # Threshold from config would be better
-                    return self._close_position_fully(position)  # Renamed method
-        except Exception as e:
-            print(f"[WARNING] Volatility check failed: {str(e)}")
+            # 1. Volatility-based emergency closure
+            volatility_action = self._check_volatility_conditions(position)
+            if volatility_action is not None:  # Returns True if closed, False if not
+                return volatility_action
 
-        # 2. Normal position management
-        try:
+            # 2. Normal position management
             current_price = float(position['price_current'])
             entry_price = float(position['price_open'])
-            buffer_pct = self.config.LOSS_BUFFER_PCT
-            close_ratio = self.config.PARTIAL_CLOSE_RATIO
-
-            # Breakeven logic
-            breakeven_price = entry_price * (1 + buffer_pct) if position['type'] == 'buy' else entry_price * (1 - buffer_pct)
             
-            if ((position['type'] == 'buy' and current_price >= breakeven_price) or
-                (position['type'] == 'sell' and current_price <= breakeven_price)):
+            # 3. Breakeven logic with buffer
+            if self._move_to_breakeven(position, current_price, entry_price):
+                return True
+                
+            # 4. Smart partial closure
+            return self._execute_partial_close(position)
+            
+        except Exception as e:
+            logger.error(f"Position handling failed for ticket {position.get('ticket')}: {str(e)}")
+            return False
+
+    def _check_volatility_conditions(self, position: Dict) -> Optional[bool]:
+        """Check various volatility metrics and handle accordingly"""
+        try:
+            # 1. Volatility index check
+            if hasattr(self.data_fetcher, 'get_volatility_index'):
+                vol_idx = self.data_fetcher.get_volatility_index(position['symbol'])
+                if vol_idx > self.config.VOLATILITY_CLOSE_THRESHOLD:  # Should be defined in Config
+                    logger.warning(f"High volatility closure (Index: {vol_idx})")
+                    return self._close_position_fully(position)
+                    
+            # 2. ATR spike detection
+            current_atr = self.data_fetcher.get_daily_atr(position['symbol'])
+            if current_atr and hasattr(self.config, 'BASELINE_ATR'):
+                if current_atr > (self.config.BASELINE_ATR * self.config.ATR_SPIKE_MULTIPLIER):
+                    logger.warning(f"ATR spike closure ({current_atr:.2f} > {self.config.BASELINE_ATR * self.config.ATR_SPIKE_MULTIPLIER:.2f})")
+                    return self._close_position_fully(position)
+                    
+            return None
+        except Exception as e:
+            logger.error(f"Volatility check failed: {str(e)}")
+            return None
+
+    def _move_to_breakeven(self, position: Dict, current_price: float, entry_price: float) -> bool:
+        """Move stop to breakeven if price reaches buffer level"""
+        buffer_pct = self.config.LOSS_BUFFER_PCT
+        if position['type'] == 'buy':
+            breakeven_price = entry_price * (1 + buffer_pct)
+            if current_price >= breakeven_price:
                 return self.mt5.modify_position(
                     position['ticket'],
                     sl=breakeven_price,
-                    tp=float(position['tp'])
+                    tp=0  # No TP in trailing stop system
                 )
-            
-            # Partial close if no breakeven adjustment
-            close_volume = round(float(position['volume']) * close_ratio, 2)
-            if close_volume >= 0.01:  # Minimum lot size
-                return self.mt5.close_position(position['ticket'], close_volume)
-                
-            return False
+        else:  # sell
+            breakeven_price = entry_price * (1 - buffer_pct)
+            if current_price <= breakeven_price:
+                return self.mt5.modify_position(
+                    position['ticket'],
+                    sl=breakeven_price,
+                    tp=0  # No TP in trailing stop system
+                )
+        return False
 
-        except Exception as e:
-            print(f"[ERROR] Position handling failed: {str(e)}")
-            return False
+    def _execute_partial_close(self, position: Dict) -> bool:
+        """Execute partial closure based on risk parameters"""
+        close_ratio = self.config.PARTIAL_CLOSE_RATIO
+        close_volume = round(float(position['volume']) * close_ratio, 2)
+        
+        if close_volume >= 0.01:  # Minimum lot size
+            # Add RSI check before closing
+            if hasattr(self.data_fetcher, 'get_rsi'):
+                rsi = self.data_fetcher.get_rsi(position['symbol'])
+                if rsi < 30 or rsi > 70:  # Only close in extreme RSI zones
+                    logger.info(f"Partial close skipped - RSI {rsi} not in extreme zone")
+                    return False
+                    
+            return self.mt5.close_position(position['ticket'], close_volume)
+        return False
 
     def _close_position_fully(self, position: Dict) -> bool:
         """Close entire position (helper method)"""
@@ -6682,36 +6766,65 @@ class TradingBot:
 
     def trigger_emergency_stop(self):
         """
-        Emergency stop with volatility protection.
+        Enhanced emergency stop with multiple volatility triggers.
         Triggers when:
         1. Manually called
-        2. ATR exceeds 3x baseline (if baseline exists)
+        2. ATR exceeds configured multiplier of baseline (default 3x)
+        3. Volatility index exceeds threshold (if available)
         """
         try:
-            # 1. Check volatility condition if baseline exists
-            baseline_atr = getattr(self.config, 'BASELINE_ATR', None)
+            emergency_triggered = False
+            trigger_reason = "Manual activation"
             current_atr = None
-            
-            if baseline_atr is not None:
-                current_atr = self.data_fetcher.get_daily_atr(self.config.SYMBOL)
-                if current_atr and current_atr > (3 * baseline_atr):
-                    print(f"[EMERGENCY] Volatility spike detected (ATR: {current_atr:.2f} > {3*baseline_atr:.2f})")
+            vol_idx = None
 
-            # 2. Execute emergency procedures
-            print("[EMERGENCY] Activating full shutdown sequence")
-            self.risk_manager.emergency_stop.activate()
-            self._close_all_positions()
-            
-            # 3. Print final status
-            print(f"[EMERGENCY] All positions closed | Volatility: {current_atr or 'N/A'}")
+            # 1. Check ATR spike condition
+            if hasattr(self.config, 'BASELINE_ATR') and self.config.BASELINE_ATR:
+                current_atr = self.data_fetcher.get_daily_atr(self.config.SYMBOL)
+                if current_atr and current_atr > (self.config.ATR_SPIKE_MULTIPLIER * self.config.BASELINE_ATR):
+                    emergency_triggered = True
+                    trigger_reason = (f"ATR spike ({current_atr:.2f} > " 
+                                    f"{self.config.ATR_SPIKE_MULTIPLIER}x baseline)")
+
+            # 2. Check volatility index if available
+            if not emergency_triggered and hasattr(self.data_fetcher, 'get_volatility_index'):
+                vol_idx = self.data_fetcher.get_volatility_index(self.config.SYMBOL)
+                if vol_idx and vol_idx > self.config.VOLATILITY_CLOSE_THRESHOLD:
+                    emergency_triggered = True
+                    trigger_reason = f"Volatility index ({vol_idx}) exceeded threshold"
+
+            # 3. Execute emergency procedures if any trigger activated
+            if emergency_triggered or self.risk_manager.emergency_stop.check():
+                logger.critical(f"🚨 EMERGENCY STOP ACTIVATED - {trigger_reason}")
+                
+                # Close all positions first
+                closed_positions = self._close_all_positions()
+                
+                # Activate emergency stop to prevent new trades
+                self.risk_manager.emergency_stop.activate()
+                
+                # Log full status
+                logger.critical(
+                    f"Emergency status:\n"
+                    f"- Positions closed: {closed_positions}\n"
+                    f"- Current ATR: {current_atr or 'N/A'}\n"
+                    f"- Volatility Index: {vol_idx or 'N/A'}\n"
+                    f"- Baseline ATR: {getattr(self.config, 'BASELINE_ATR', 'N/A')}"
+                )
+                
+                return True
+
+            return False
 
         except Exception as e:
-            print(f"[EMERGENCY ERROR] {str(e)}")
+            logger.critical(f"EMERGENCY STOP FAILED: {str(e)}", exc_info=True)
             # Final attempt to close positions
             try:
                 self._close_all_positions()
+                return True
             except Exception as final_error:
-                print(f"[CRITICAL] Failed to close positions: {str(final_error)}")
+                logger.critical(f"FINAL CLOSE ATTEMPT FAILED: {str(final_error)}")
+                return False
 
     def _get_current_atr(self, symbol: str) -> Optional[float]:
         """Get cached ATR value with fallback to fresh calculation
@@ -6738,23 +6851,32 @@ class TradingBot:
     
     def _add_to_position(self, position: Dict, current_price: Dict) -> bool:
         """Add to an existing position when conditions are favorable"""
+        rsi = None  # Initialize with default value
+        
         try:
-            # 1. Check if we can add to position
+            # 1. Check RSI condition first (before other checks)
+            if hasattr(self.data_fetcher, 'get_rsi'):
+                rsi = self.data_fetcher.get_rsi(position['symbol'])
+                if not (self.config.RSI_PYRAMIDING_MIN <= rsi <= self.config.RSI_PYRAMIDING_MAX):
+                    logger.debug(f"RSI {rsi:.1f} outside pyramiding range ({self.config.RSI_PYRAMIDING_MIN}-{self.config.RSI_PYRAMIDING_MAX})")
+                    return False
+
+            # 2. Check if we can add to position
             open_positions = self.mt5.get_open_positions(symbol=position['symbol'])
             if open_positions is None or len(open_positions) >= self.config.MAX_OPEN_POSITIONS:
                 return False
                 
-            # 2. Calculate new position size (max 50% of original)
+            # 3. Calculate new position size (max 50% of original)
             original_size = float(position['volume'])
             
-            # 3. Calculate dynamic stop loss
+            # 4. Calculate dynamic stop loss
             atr = self.data_fetcher.get_daily_atr(position['symbol'])
             if atr is None:
                 return False
                 
             stop_distance = atr * self.config.ATR_STOP_LOSS_FACTOR
             
-            # 4. Determine direction and price levels
+            # 5. Determine direction and price levels
             if position['type'] == 'buy':
                 add_type = 'buy'
                 price = current_price['ask']
@@ -6764,12 +6886,12 @@ class TradingBot:
                 price = current_price['bid']
                 sl = price + stop_distance
                 
-            # 5. Calculate size to add (50% of original, with min size check)
+            # 6. Calculate size to add (50% of original, with min size check)
             add_size = round(original_size * 0.5, 2)
             if add_size < 0.01:  # Minimum lot size
                 return False
                 
-            # 6. Verify margin requirements
+            # 7. Verify margin requirements
             if not self.risk_manager.check_margin_requirements(
                 symbol=position['symbol'],
                 volume=add_size,
@@ -6778,7 +6900,7 @@ class TradingBot:
             ):
                 return False
                 
-            # 7. Execute additional position
+            # 8. Execute additional position
             result = self.mt5.send_order(
                 symbol=position['symbol'],
                 order_type=add_type,
@@ -6788,11 +6910,18 @@ class TradingBot:
                 comment=f"ADD-{position['ticket']}"
             )
             
-            # 8. Explicit boolean return
-            return bool(result and result.get('retcode') == mt5.TRADE_RETCODE_DONE)
+            if result and result.get('retcode') == mt5.TRADE_RETCODE_DONE:
+                # Only include RSI in log if we actually checked it
+                log_message = f"Added {add_size} lots to position {position['ticket']}"
+                if rsi is not None:
+                    log_message += f" (RSI: {rsi:.1f})"
+                logger.info(log_message)
+                return True
+                
+            return False
             
         except Exception as e:
-            logger.error(f"Failed to add to position {position['ticket']}: {str(e)}")
+            logger.error(f"Failed to add to position {position.get('ticket')}: {str(e)}")
             return False
 
 
