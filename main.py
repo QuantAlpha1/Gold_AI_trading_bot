@@ -2947,6 +2947,7 @@ class DataFetcher:
                 return None
 
 
+
 class DataPreprocessor:
     """Handles data preprocessing and feature engineering with comprehensive validation"""
     
@@ -6516,45 +6517,71 @@ class TradingBot:
             return False
     
     def _update_trailing_stop(self, position: Dict) -> bool:
-        """ATR-based trailing stop with internal data fetching"""
-        symbol = position['symbol']
-        
-        # 1. Get required market data
-        current_price = self.data_fetcher.get_current_price(symbol)
-        if not current_price:
-            print(f"[WARN] No price data for {symbol}")
+        """
+        Enhanced ATR trailing stop with backtesting support using get_last_n_candles().
+        - Uses live prices when available, falls back to last candle's close for backtesting
+        - Configurable ATR multiplier from settings
+        - Directionally-locked (only moves stops favorably)
+        """
+        try:
+            symbol = position['symbol']
+            
+            # 1. Get price - try live first, then last candle
+            current_price = None
+            live_price = self.data_fetcher.get_current_price(symbol)
+            
+            if live_price:
+                current_price = live_price.get('bid') if position['type'] == 'buy' else live_price.get('ask')
+            else:
+                # Fallback to last candle's close price
+                candles = self.data_fetcher.get_last_n_candles(symbol, self.config.TIMEFRAME, 1)
+                if candles is not None and not candles.empty:
+                    current_price = float(candles.iloc[-1]['close'])
+            
+            if current_price is None:
+                logger.warning(f"No valid price data for {symbol}")
+                return False
+                
+            # 2. Get ATR value
+            atr = self._get_current_atr(symbol)
+            if atr is None:
+                logger.warning(f"No ATR data for {symbol}")
+                return False
+                
+            # 3. Calculate new stop level
+            multiplier = self.config.TRAILING_STOP_ATR_MULTIPLIER
+            if position['type'] == 'buy':
+                new_sl = current_price - (multiplier * atr)
+                current_sl = position['sl'] if position['sl'] else position['price_open'] - (multiplier * atr)
+                should_modify = new_sl > current_sl
+            else:  # sell
+                new_sl = current_price + (multiplier * atr)
+                current_sl = position['sl'] if position['sl'] else position['price_open'] + (multiplier * atr)
+                should_modify = new_sl < current_sl
+            
+            # 4. Execute modification if needed
+            if should_modify:
+                modified = self.mt5.modify_position(
+                    ticket=position['ticket'],
+                    sl=new_sl,
+                    tp=0  # No take-profit in trailing stop system
+                )
+                if modified:
+                    logger.info(
+                        f"Updated trailing stop for {symbol}:\n"
+                        f"• Type: {position['type']}\n"
+                        f"• New SL: {new_sl:.5f}\n" 
+                        f"• Price: {current_price:.5f}\n"
+                        f"• ATR: {atr:.5f} (x{multiplier})"
+                    )
+                    return True
+                    
             return False
             
-        atr = self._get_current_atr(symbol)  # Use your existing cache-aware method
-        if atr is None:
-            print(f"[WARN] No ATR data for {symbol}")
+        except Exception as e:
+            logger.error(f"Trailing stop update failed: {str(e)}", exc_info=True)
             return False
-        
-        # 2. Calculate new stop
-        new_sl: float
-        modified = False
-        
-        if position['type'] == 'buy':
-            new_sl = current_price['bid'] - (3 * atr)
-            if new_sl > position['sl']:  # Only move stop up
-                modified = self.mt5.modify_position(
-                    ticket=position['ticket'],
-                    sl=new_sl,
-                    tp=position['tp']
-                )
-        else:
-            new_sl = current_price['ask'] + (3 * atr)
-            if new_sl < position['sl'] or position['sl'] == 0:  # Only move stop down
-                modified = self.mt5.modify_position(
-                    ticket=position['ticket'],
-                    sl=new_sl,
-                    tp=position['tp']
-                )
-        
-        if modified:
-            print(f"[INFO] Updated trailing stop for {symbol} to {new_sl:.5f}")
-        return modified
-
+    
     def _update_all_trailing_stops(self):
         """Update all active positions with trailing stops"""
         try:
