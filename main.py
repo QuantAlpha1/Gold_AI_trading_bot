@@ -693,7 +693,6 @@ class Config(BaseModel):
     ACCOUNT_BALANCE: float = Field(..., gt=0, description="Current account balance in USD")
     RISK_PER_TRADE: float = Field(default=0.02, gt=0, le=0.05)
     INITIAL_STOP_LOSS: float = Field(default=100, gt=5, le=500)
-    INITIAL_TAKE_PROFIT: float = 150
     MAX_TRADES_PER_DAY: int = Field(default=20, gt=0, le=100)
     MAX_OPEN_POSITIONS: int = Field(default=5, gt=0, le=20)
     MAX_ALLOWED_SPREAD: float = Field(default=2.0, gt=0, le=10.0, description="Maximum allowed spread in pips")
@@ -712,6 +711,14 @@ class Config(BaseModel):
     MODEL_VERSION: str = "1.0"
     USE_ATR_SIZING: bool = Field(default=True)
     ATR_LOOKBACK: int = Field(default=14, gt=5, le=50)  # Period for ATR calculation
+    ATR_TRAILING_MULTIPLIER: float = Field(default=3.0, gt=0.5, le=5.0, 
+                                        description="Multiplier for ATR-based trailing stops")
+    TRAILING_STOP_ATR_MULTIPLIER: float = Field(
+        default=3.0, 
+        gt=1.0,  # Minimum 1x ATR
+        le=5.0,  # Maximum 5x ATR
+        description="Multiplier for ATR-based trailing stops (e.g. 3.0 = 3xATR)"
+    )
     USE_ATR_SIZING: bool = True  # Dynamic SL enabled by default
     MIN_STOP_DISTANCE: float = 50  # Fallback if ATR too small (pips)
     ATR_STOP_LOSS_FACTOR: float = Field(default=1.5, gt=0.0, le=5.0)
@@ -727,6 +734,10 @@ class Config(BaseModel):
     VOLUME_MA_WINDOW: int = 20
     VOLUME_ROC_PERIOD: int = 5
     
+    BASELINE_ATR = 10.0  # Symbol-specific typical ATR value
+    DEFAULT_ATR = 5.0     # Fallback if live ATR unavailable
+    PARTIAL_CLOSE_RATIO = 0.5  # Close 50% on adverse move
+
     MAX_CONSECUTIVE_LOSSES: int = Field(
         default=3,
         gt=0,
@@ -871,14 +882,18 @@ class Config(BaseModel):
         return v
         
     @model_validator(mode='after')
-    def validate_risk_reward(self) -> 'Config':
-        """Final business logic validation"""
-        if self.INITIAL_TAKE_PROFIT <= self.INITIAL_STOP_LOSS:
-            raise ValueError('Take profit must exceed stop loss')
+    def validate_trailing_stop(self) -> 'Config':
+        """Validate trailing stop parameters"""
+        if not hasattr(self, 'TRAILING_STOP_ATR_MULTIPLIER'):
+            return self
+            
+        if self.TRAILING_STOP_ATR_MULTIPLIER <= 0:
+            raise ValueError('Trailing stop ATR multiplier must be positive')
         
-        ratio = self.INITIAL_TAKE_PROFIT / self.INITIAL_STOP_LOSS
-        if ratio < 1.5:
-            print(f"Warning: Risk/reward ratio {ratio:.1f}:1 is suboptimal")
+        # Example: Warn if trailing stop is too tight
+        if self.TRAILING_STOP_ATR_MULTIPLIER < 2.0:
+            print(f"Warning: Trailing stop multiplier {self.TRAILING_STOP_ATR_MULTIPLIER} may be too tight")
+        
         return self
 
     @field_validator('TIMEFRAME')
@@ -902,10 +917,40 @@ class Config(BaseModel):
         return value
 
     def __str__(self) -> str:
+        # Build dynamic components
+        risk_info = f"RISK={self.RISK_PER_TRADE*100}%"
+        stop_info = f"SL={self.INITIAL_STOP_LOSS}pips"
+        
+        # Add ATR info if using ATR sizing
+        atr_info = ""
+        if self.USE_ATR_SIZING:
+            atr_info = f", ATR={self.ATR_LOOKBACK}periods@{self.ATR_STOP_LOSS_FACTOR}x"
+        
+        # Add volatility settings if available
+        vol_info = ""
+        if hasattr(self, 'VOLATILITY_SETTINGS'):
+            vol_info = f", VolProfile={self.VOLATILITY_SETTINGS.get(self.SYMBOL, {}).get('multiplier', 1.0)}x"
+        
+        # Simple timeframe mapping without calling MT5Wrapper
+        timeframe_map = {
+            1: "M1",
+            5: "M5",
+            15: "M15",
+            30: "M30",
+            60: "H1",
+            240: "H4",
+            1440: "D1",
+            10080: "W1",
+            43200: "MN1"
+        }
+        tf_name = timeframe_map.get(self.TIMEFRAME, f"Unknown({self.TIMEFRAME})")
+        
         return (f"Config(SYMBOL={self.SYMBOL}, "
-                f"RISK={self.RISK_PER_TRADE*100}%, "
-                f"SL/TP={self.INITIAL_STOP_LOSS}/{self.INITIAL_TAKE_PROFIT}, "
-                f"TF={self.TIMEFRAME})")
+                f"{risk_info}, "
+                f"{stop_info}"
+                f"{atr_info}"
+                f"{vol_info}, "
+                f"TF={tf_name})")
 
 
 class PerformanceMonitor:
@@ -2710,6 +2755,154 @@ class DataFetcher:
         except Exception as e:
             logger.error(f"ATR calculation error: {str(e)}")
             return 0.0
+
+    def get_rsi(self, symbol: Optional[str] = None, timeframe: Optional[int] = None, period: int = 14) -> float:
+        """
+        Calculate current RSI value for a symbol.
+        
+        Args:
+            symbol: Trading symbol (uses default if None)
+            timeframe: MT5 timeframe (defaults to class timeframe)
+            period: RSI calculation period (default: 14)
+            
+        Returns:
+            float: Current RSI value (0-100) or 50.0 if calculation fails
+        """
+        from typing import Optional  # Add this at top of file if not already present
+        
+        try:
+            # Handle None values with type-safe defaults
+            symbol_str: str = symbol if symbol is not None else self.config.SYMBOL
+            timeframe_int: int = timeframe if timeframe is not None else self.config.TIMEFRAME
+            
+            # Get fresh data (2x period to ensure accurate calculation)
+            rates = self.get_historical_data(
+                symbol=symbol_str,
+                timeframe=timeframe_int,
+                num_candles=period * 2
+            )
+            
+            if rates is None or len(rates) < period:
+                return 50.0  # Neutral value if insufficient data
+                
+            # Calculate price changes
+            closes = rates['close'].astype(float)
+            deltas = closes.diff()
+            
+            # Separate gains and losses
+            gains = deltas.where(deltas > 0, 0)
+            losses = -deltas.where(deltas < 0, 0)
+            
+            # Calculate average gains/losses
+            avg_gain = gains.rolling(period).mean().iloc[-1]
+            avg_loss = losses.rolling(period).mean().iloc[-1]
+            
+            # Handle edge case (zero loss)
+            if avg_loss == 0:
+                return 100.0 if avg_gain > 0 else 50.0
+                
+            # Calculate RS and RSI
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            return round(rsi, 2)
+            
+        except Exception as e:
+            symbol_for_error = symbol if symbol is not None else self.config.SYMBOL
+            print(f"[ERROR] RSI calculation failed for {symbol_for_error}: {str(e)}")
+            return 50.0  # Neutral fallback value
+        
+    def get_volatility_index(self, symbol: Optional[str] = None) -> float:
+        """
+        Calculate basic volatility index (0-100) using current ATR vs 14-day average.
+        
+        Args:
+            symbol: Optional trading symbol (uses default symbol if None)
+        
+        Returns:
+            float: 0-100 volatility index (30 = neutral baseline)
+        """
+        try:
+            # Type-safe symbol handling
+            symbol_str: str = symbol if symbol is not None else self.config.SYMBOL
+            
+            # 1. Get current ATR
+            current_atr = self.get_current_atr(symbol_str, period=14)
+            if current_atr is None:
+                return 30.0  # Neutral default if data unavailable
+            
+            # 2. Get 14-day average ATR
+            hist_data = self.get_historical_data(
+                symbol=symbol_str,
+                timeframe=self.config.TIMEFRAME,
+                num_candles=14
+            )
+            if hist_data is None or len(hist_data) < 14:
+                return 30.0
+                
+            avg_atr = hist_data['atr'].mean()
+            
+            # 3. Calculate simple ratio
+            ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+            
+            # 4. Scale to 0-100 (30 = baseline)
+            volatility_index = min(100, max(0, (ratio * 30)))
+            
+            return round(volatility_index, 1)
+            
+        except Exception:
+            return 30.0  # Fail-safe neutral value
+    
+    def get_current_atr(self, symbol: str, period: int = 14) -> Optional[float]:
+        """
+        Get current ATR value with thread-safe caching.
+        
+        Args:
+            symbol: Trading symbol
+            period: ATR period (default: 14)
+            
+        Returns:
+            Current ATR value or None if calculation fails
+        """
+        # Input validation
+        if not isinstance(symbol, str) or not symbol.isalpha():
+            logger.error(f"Invalid symbol: {symbol}")
+            return None
+            
+        period = max(5, min(period, 50))  # Keep within reasonable bounds
+
+        with self._cache_lock:
+            # Check cache first
+            cache_key = f"current_atr_{symbol}_{period}"
+            if cache_key in self._atr_cache:
+                value, timestamp = self._atr_cache[cache_key]
+                if (datetime.now() - timestamp).total_seconds() < self._cache_expiry['volatility']:
+                    return value
+
+            try:
+                # Get fresh data with buffer
+                rates = self.get_historical_data(
+                    symbol=symbol,
+                    timeframe=self.timeframe,
+                    num_candles=period + 10  # Extra buffer for calculation
+                )
+                
+                if rates is None or len(rates) < period:
+                    logger.warning(f"Insufficient data for {period}-period ATR on {symbol}")
+                    return None
+
+                # Calculate ATR
+                atr = self._calculate_atr(rates, period)
+                if atr <= 0 or np.isnan(atr):
+                    return None
+
+                # Update cache
+                self._atr_cache[cache_key] = (atr, datetime.now())
+                return atr
+
+            except Exception as e:
+                logger.error(f"Current ATR calculation failed for {symbol}: {str(e)}")
+                return None
 
 
 class DataPreprocessor:
@@ -5821,10 +6014,10 @@ class TradingBot:
             stop_loss_pips = self.risk_manager.get_effective_stop_loss(Config.SYMBOL)
             if trade_type == "buy":
                 sl_price = requested_price - stop_loss_pips
-                tp_price = requested_price + (self.config.INITIAL_TAKE_PROFIT * 0.1)
+                tp_price = 0
             else:  # sell
                 sl_price = requested_price + stop_loss_pips
-                tp_price = requested_price - (self.config.INITIAL_TAKE_PROFIT * 0.1)
+                tp_price = 0
 
             # ===== CRITICAL VALIDATION ADDITION =====
             if not self.risk_manager._validate_price_levels(Config.SYMBOL, requested_price, sl_price, tp_price):
@@ -6190,93 +6383,52 @@ class TradingBot:
             tp=new_tp
         )
 
-    def _add_to_position(self, position: Dict, current_price: Dict) -> bool:
-        """Add to winning position with robust error handling"""
-        # Validate inputs
-        if not position or not current_price or 'type' not in position:
-            logger.warning("Invalid position or price data")
-            return False
-
-        try:
-            # Get required prices with validation
-            price_key = 'ask' if position['type'] == 'buy' else 'bid'
-            price = float(current_price[price_key])
-            entry_price = float(position['price_open'])
-
-            # Calculate position size (50% of initial)
-            additional_size = round(self.risk_manager.calculate_position_size(
-                self.config.SYMBOL, 
-                self.config.INITIAL_STOP_LOSS
-            ) * 0.5, 2)
-
-            if additional_size <= 0:
-                logger.warning(f"Invalid position size: {additional_size}")
-                return False
-
-            # Calculate SL/TP in price terms
-            multiplier = 1 if position['type'] == 'buy' else -1
-            new_sl = entry_price + (multiplier * self.config.INITIAL_STOP_LOSS * 0.1 * 0.5)
-            new_tp = price + (multiplier * self.config.INITIAL_TAKE_PROFIT * 0.1)
-
-            # Send order through MT5 connector
-            result = self.mt5.send_order(
-                symbol=self.config.SYMBOL,
-                order_type=position['type'],
-                volume=additional_size,
-                sl=new_sl,
-                tp=new_tp,
-                comment=f"AI-ADD-{position['type'].upper()}"
-            )
-
-            # Handle result with proper None checking
-            if result is None:
-                logger.error("Order failed - no result returned from MT5")
-                return False
-                
-            retcode = getattr(result, 'retcode', None)
-            if retcode == MT5Wrapper.TRADE_RETCODE_DONE:
-                logger.info(f"Added {additional_size} lots to {position['type']} position")
-                return True
-                
-            # Log specific error if available
-            error_msg = getattr(result, 'comment', 'Unknown error')
-            logger.error(f"Order failed with retcode: {retcode} - {error_msg}")
-            return False
-
-        except KeyError as e:
-            logger.error(f"Missing price data: {str(e)}")
-        except (TypeError, ValueError) as e:
-            logger.error(f"Invalid numeric data: {str(e)}")
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-        
-        return False
-    
     def _handle_losing_position(self, position: Dict) -> bool:
-        """Close partial position or move SL to breakeven using Config params."""
+        """Handle losing positions with volatility checks and partial closing"""
+        # 1. First check volatility if available
         try:
-            # Get params from config
+            if hasattr(self.data_fetcher, 'get_volatility_index'):
+                vol_idx = self.data_fetcher.get_volatility_index(position['symbol'])
+                if vol_idx > 30:  # Threshold from config would be better
+                    return self._close_position_fully(position)  # Renamed method
+        except Exception as e:
+            print(f"[WARNING] Volatility check failed: {str(e)}")
+
+        # 2. Normal position management
+        try:
+            current_price = float(position['price_current'])
+            entry_price = float(position['price_open'])
             buffer_pct = self.config.LOSS_BUFFER_PCT
             close_ratio = self.config.PARTIAL_CLOSE_RATIO
 
-            # Calculate breakeven with configurable buffer
-            breakeven_price = float(position['price_open']) * (1 + buffer_pct)
-            close_volume = round(float(position['volume']) * close_ratio, 2)
-
-            if close_volume <= 0:
-                return False
-
-            if float(position['price_current']) >= breakeven_price:
+            # Breakeven logic
+            breakeven_price = entry_price * (1 + buffer_pct) if position['type'] == 'buy' else entry_price * (1 - buffer_pct)
+            
+            if ((position['type'] == 'buy' and current_price >= breakeven_price) or
+                (position['type'] == 'sell' and current_price <= breakeven_price)):
                 return self.mt5.modify_position(
                     position['ticket'],
                     sl=breakeven_price,
-                    tp=float(position['tp'])  # Keep original TP
+                    tp=float(position['tp'])
                 )
-            else:
+            
+            # Partial close if no breakeven adjustment
+            close_volume = round(float(position['volume']) * close_ratio, 2)
+            if close_volume >= 0.01:  # Minimum lot size
                 return self.mt5.close_position(position['ticket'], close_volume)
+                
+            return False
 
         except Exception as e:
-            logger.error(f"Position handling failed: {str(e)}")
+            print(f"[ERROR] Position handling failed: {str(e)}")
+            return False
+
+    def _close_position_fully(self, position: Dict) -> bool:
+        """Close entire position (helper method)"""
+        try:
+            return self.mt5.close_position(position['ticket'], position['volume'])
+        except Exception as e:
+            print(f"[ERROR] Full close failed: {str(e)}")
             return False
     
     def _update_trailing_stop(self, position: Dict) -> bool:
@@ -6529,9 +6681,37 @@ class TradingBot:
                 )
 
     def trigger_emergency_stop(self):
-        """Public method for manual emergency stop"""
-        self.risk_manager.emergency_stop.activate()
-        self._close_all_positions()
+        """
+        Emergency stop with volatility protection.
+        Triggers when:
+        1. Manually called
+        2. ATR exceeds 3x baseline (if baseline exists)
+        """
+        try:
+            # 1. Check volatility condition if baseline exists
+            baseline_atr = getattr(self.config, 'BASELINE_ATR', None)
+            current_atr = None
+            
+            if baseline_atr is not None:
+                current_atr = self.data_fetcher.get_daily_atr(self.config.SYMBOL)
+                if current_atr and current_atr > (3 * baseline_atr):
+                    print(f"[EMERGENCY] Volatility spike detected (ATR: {current_atr:.2f} > {3*baseline_atr:.2f})")
+
+            # 2. Execute emergency procedures
+            print("[EMERGENCY] Activating full shutdown sequence")
+            self.risk_manager.emergency_stop.activate()
+            self._close_all_positions()
+            
+            # 3. Print final status
+            print(f"[EMERGENCY] All positions closed | Volatility: {current_atr or 'N/A'}")
+
+        except Exception as e:
+            print(f"[EMERGENCY ERROR] {str(e)}")
+            # Final attempt to close positions
+            try:
+                self._close_all_positions()
+            except Exception as final_error:
+                print(f"[CRITICAL] Failed to close positions: {str(final_error)}")
 
     def _get_current_atr(self, symbol: str) -> Optional[float]:
         """Get cached ATR value with fallback to fresh calculation
@@ -6556,6 +6736,65 @@ class TradingBot:
         """Public interface for model refresh"""
         return self.ml_model.refresh_model()
     
+    def _add_to_position(self, position: Dict, current_price: Dict) -> bool:
+        """Add to an existing position when conditions are favorable"""
+        try:
+            # 1. Check if we can add to position
+            open_positions = self.mt5.get_open_positions(symbol=position['symbol'])
+            if open_positions is None or len(open_positions) >= self.config.MAX_OPEN_POSITIONS:
+                return False
+                
+            # 2. Calculate new position size (max 50% of original)
+            original_size = float(position['volume'])
+            
+            # 3. Calculate dynamic stop loss
+            atr = self.data_fetcher.get_daily_atr(position['symbol'])
+            if atr is None:
+                return False
+                
+            stop_distance = atr * self.config.ATR_STOP_LOSS_FACTOR
+            
+            # 4. Determine direction and price levels
+            if position['type'] == 'buy':
+                add_type = 'buy'
+                price = current_price['ask']
+                sl = price - stop_distance
+            else:  # sell
+                add_type = 'sell'
+                price = current_price['bid']
+                sl = price + stop_distance
+                
+            # 5. Calculate size to add (50% of original, with min size check)
+            add_size = round(original_size * 0.5, 2)
+            if add_size < 0.01:  # Minimum lot size
+                return False
+                
+            # 6. Verify margin requirements
+            if not self.risk_manager.check_margin_requirements(
+                symbol=position['symbol'],
+                volume=add_size,
+                price=price,
+                trade_type=add_type
+            ):
+                return False
+                
+            # 7. Execute additional position
+            result = self.mt5.send_order(
+                symbol=position['symbol'],
+                order_type=add_type,
+                volume=add_size,
+                sl=sl,
+                tp=0,  # No take profit - trailing stop will handle
+                comment=f"ADD-{position['ticket']}"
+            )
+            
+            # 8. Explicit boolean return
+            return bool(result and result.get('retcode') == mt5.TRADE_RETCODE_DONE)
+            
+        except Exception as e:
+            logger.error(f"Failed to add to position {position['ticket']}: {str(e)}")
+            return False
+
 
 class Backtester:
     """
