@@ -5895,7 +5895,7 @@ class TradingBot:
                 comment=f"AGGR-{trade_type.upper()}-ATR{stop_loss_pips:.0f}"
             )
 
-            # After successful trade execution (around line 137 in your current code)
+            # After successful trade execution 
             if result and result.get('retcode') == mt5.TRADE_RETCODE_DONE:
                 ticket = int(result.get('order', 0)) or int(result.get('ticket', 0))
                 
@@ -6155,10 +6155,10 @@ class TradingBot:
                 if self._handle_losing_position(full_position):
                     position_modified = True
                     
-            # Update trailing stop with current market data
-            if self._update_trailing_stop(full_position, current_price, profit_pips):
+                # Update trailing stop with current market data
+            if self._update_trailing_stop(full_position):
                 position_modified = True
-        
+    
         # Clear cache if positions were modified
         if position_modified:
             logger.debug("Position changes detected - clearing cache")
@@ -6190,36 +6190,67 @@ class TradingBot:
             tp=new_tp
         )
 
-    def _add_to_position(self, position: Dict, current_price: Dict):
-        """Add to winning position"""
-        # Calculate additional position size (half of initial)
-        additional_size = self.risk_manager.calculate_position_size(
-            Config.SYMBOL, Config.INITIAL_STOP_LOSS
-        ) / 2
+    def _add_to_position(self, position: Dict, current_price: Dict) -> bool:
+        """Add to winning position with robust error handling"""
+        # Validate inputs
+        if not position or not current_price or 'type' not in position:
+            logger.warning("Invalid position or price data")
+            return False
+
+        try:
+            # Get required prices with validation
+            price_key = 'ask' if position['type'] == 'buy' else 'bid'
+            price = float(current_price[price_key])
+            entry_price = float(position['price_open'])
+
+            # Calculate position size (50% of initial)
+            additional_size = round(self.risk_manager.calculate_position_size(
+                self.config.SYMBOL, 
+                self.config.INITIAL_STOP_LOSS
+            ) * 0.5, 2)
+
+            if additional_size <= 0:
+                logger.warning(f"Invalid position size: {additional_size}")
+                return False
+
+            # Calculate SL/TP in price terms
+            multiplier = 1 if position['type'] == 'buy' else -1
+            new_sl = entry_price + (multiplier * self.config.INITIAL_STOP_LOSS * 0.1 * 0.5)
+            new_tp = price + (multiplier * self.config.INITIAL_TAKE_PROFIT * 0.1)
+
+            # Send order through MT5 connector
+            result = self.mt5.send_order(
+                symbol=self.config.SYMBOL,
+                order_type=position['type'],
+                volume=additional_size,
+                sl=new_sl,
+                tp=new_tp,
+                comment=f"AI-ADD-{position['type'].upper()}"
+            )
+
+            # Handle result with proper None checking
+            if result is None:
+                logger.error("Order failed - no result returned from MT5")
+                return False
+                
+            retcode = getattr(result, 'retcode', None)
+            if retcode == MT5Wrapper.TRADE_RETCODE_DONE:
+                logger.info(f"Added {additional_size} lots to {position['type']} position")
+                return True
+                
+            # Log specific error if available
+            error_msg = getattr(result, 'comment', 'Unknown error')
+            logger.error(f"Order failed with retcode: {retcode} - {error_msg}")
+            return False
+
+        except KeyError as e:
+            logger.error(f"Missing price data: {str(e)}")
+        except (TypeError, ValueError) as e:
+            logger.error(f"Invalid numeric data: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
         
-        if additional_size <= 0:
-            return
-            
-        # Determine new stop loss (move to breakeven + some buffer)
-        if position['type'] == 'buy':
-            new_sl = position['entry_price'] + (Config.TRAILING_STOP_POINTS * 0.1 * 0.5)  # Half of trailing stop
-            new_tp = current_price['bid'] + (Config.INITIAL_TAKE_PROFIT * 0.1)
-        else:
-            new_sl = position['entry_price'] - (Config.TRAILING_STOP_POINTS * 0.1 * 0.5)
-            new_tp = current_price['ask'] - (Config.INITIAL_TAKE_PROFIT * 0.1)
-            
-        # Send additional order
-        success = self.mt5.send_order(
-            Config.SYMBOL,
-            position['type'],
-            additional_size,
-            new_sl,
-            new_tp,
-            comment=f"AI-ADD-{position['type'].upper()}"
-        )
-        
-        if success:
-            print(f"Added to {position['type']} position at {current_price}")
+        return False
     
     def _handle_losing_position(self, position: Dict) -> bool:
         """Close partial position or move SL to breakeven using Config params."""
@@ -6288,40 +6319,105 @@ class TradingBot:
             print(f"[INFO] Updated trailing stop for {symbol} to {new_sl:.5f}")
         return modified
 
-    def show_performance(self, periodic: bool = False):
-        """Display performance metrics and equity curve"""
+    def _update_all_trailing_stops(self):
+        """Update all active positions with trailing stops"""
+        try:
+            # Pass the symbol from config when calling get_open_positions
+            open_positions = self.mt5.get_open_positions(symbol=self.config.SYMBOL)
+            if open_positions is None:
+                return False
+                
+            for position in open_positions:
+                if position['symbol'] == self.config.SYMBOL:
+                    self._update_trailing_stop(position)
+            return True
+        except Exception as e:
+            print(f"Error updating trailing stops: {str(e)}")
+            return False
+        
+    def show_performance(self, periodic: bool = False, include_metrics: bool = False) -> None:
+        """Display comprehensive performance metrics with optional advanced metrics
+        
+        Args:
+            periodic: If True, indicates this is a periodic update (may reduce output)
+            include_metrics: If True, shows advanced risk/return metrics
+        """
         if not hasattr(self, 'performance_monitor'):
             print("Performance monitoring not initialized")
             return
             
+        # Get the full performance report
         report = self.performance_monitor.get_performance_report()
         
-        print("\n=== Performance Report ===")
-        for k, v in report.items():
-            print(f"{k.replace('_', ' ').title()}: {v}")
-
-        # Add annualized return
-        annual_return = self.performance_monitor._calc_annualized_return()
-        print(f"Annualized Return: {annual_return:.2f}%")
+        # Core display logic
+        print("\n=== PERFORMANCE REPORT ===" if not periodic else "\n=== Periodic Update ===")
         
-        # Environment metrics (only if available)
-        if self.trading_env is not None:
+        # Always show these core metrics
+        core_metrics = [
+            ('Equity', f"${report['equity_curve'][-1]:,.2f}"),
+            ('Total Trades', report['total_trades']),
+            ('Win Rate', report['win_rate']),
+            ('Profit Factor', report['profit_factor']),
+            ('Annualized Return', f"{self.performance_monitor._calc_annualized_return():.2f}%")
+        ]
+        
+        for metric, value in core_metrics:
+            print(f"{metric}: {value}")
+
+        # Conditional advanced metrics
+        if include_metrics:
+            print("\n=== RISK METRICS ===")
+            advanced_metrics = [
+                ('Sharpe Ratio', report['sharpe_ratio']),
+                ('Sortino Ratio', report['sortino_ratio']),
+                ('Calmar Ratio', report['calmar_ratio']),
+                ('Max Drawdown', report['max_drawdown']),
+                ('Avg Winning Trade', report['advanced_stats']['avg_win']),
+                ('Avg Losing Trade', report['advanced_stats']['avg_loss']),
+                ('Win/Loss Ratio', report['advanced_stats']['win_loss_ratio'])
+            ]
+            
+            for metric, value in advanced_metrics:
+                print(f"{metric}: {value}")
+
+        # Environment metrics (if available)
+        if hasattr(self, 'trading_env') and self.trading_env is not None:
             try:
-                env_pf = self.trading_env.get_profit_factor()
-                print(f"Environment Profit Factor: {env_pf:.2f}")
-                if env_pf < 1.5:
-                    logger.warning("Environment profit factor below 1.5 - reconsider strategy")
+                print("\n=== ENVIRONMENT METRICS ===")
+                env_metrics = [
+                    ('Profit Factor', self.trading_env.get_profit_factor()),
+                    ('Total Reward', self.trading_env.get_total_reward())
+                ]
                 
-                env_reward = self.trading_env.get_total_reward()
-                print(f"Environment Total Reward: {env_reward:.2f}")
+                for metric, value in env_metrics:
+                    print(f"{metric}: {value:.2f}")
+                    
+                if env_metrics[0][1] < 1.5:  # Profit factor check
+                    logger.warning("Environment profit factor below 1.5 - reconsider strategy")
+                    
             except Exception as e:
                 logger.error(f"Failed to get environment metrics: {str(e)}")
-        
-        # Plotting logic remains the same
-        if not periodic or len(self.performance_monitor.metrics['all_trades']) % 100 == 0:
+
+        # Warnings section (always shown)
+        if report.get('warnings'):
+            print("\n=== WARNINGS ===")
+            for warning in report['warnings']:
+                print(f"! {warning}")
+
+        # Plotting logic (conditionally based on periodic flag)
+        should_plot = not periodic or len(self.performance_monitor.metrics['all_trades']) % 100 == 0
+        if should_plot:
             try:
                 import matplotlib.pyplot as plt
-                self.performance_monitor.plot_equity_curve().show()
+                plt = self.performance_monitor.plot_equity_curve()
+                
+                # Enhanced plotting for periodic updates
+                if periodic:
+                    plt.title(f"Equity Curve (Last {len(self.performance_monitor.metrics['all_trades'])} Trades)")
+                else:
+                    plt.title("Full Equity Curve")
+                    
+                plt.show()
             except ImportError:
                 print("Matplotlib not available - cannot show equity curve")
             except Exception as e:
@@ -7122,21 +7218,7 @@ class EmergencyStop:
                     f"reason: {status['reason']}{timeout_info})")
         return "EmergencyStop(INACTIVE)"
 
-# Needs to be added: # In your trading cycle:
-"""
-for position in active_positions:
-    self._update_trailing_stop(position)
-"""
 
-
-
-"""
-In main loop:
-python
-
-# Run every 60 seconds
-self._update_all_trailing_stops()
-"""
 
 
 if __name__ == "__main__":
@@ -7200,15 +7282,20 @@ if __name__ == "__main__":
             mt5_connector=mt5_connector,
             preprocessor=preprocessor
         )
-        
-        # Add command-line interface for backtesting
-        parser = argparse.ArgumentParser(description='Trading Bot with Backtesting')
-        parser.add_argument('--backtest', action='store_true', help='Run in backtest mode')
-        parser.add_argument('--walkforward', action='store_true', help='Run walkforward validation')
-        parser.add_argument('--montecarlo', action='store_true', help='Run Monte Carlo simulations')
-        parser.add_argument('--periods', type=int, default=500, help='Number of periods to backtest')
-        args = parser.parse_args()
 
+    except Exception as e:
+        logger.critical(f"Initialization failed: {str(e)}", exc_info=True)
+        sys.exit(1)  # Exit with error code
+
+    # Add command-line interface for backtesting
+    parser = argparse.ArgumentParser(description='Trading Bot with Backtesting')
+    parser.add_argument('--backtest', action='store_true', help='Run in backtest mode')
+    parser.add_argument('--walkforward', action='store_true', help='Run walkforward validation')
+    parser.add_argument('--montecarlo', action='store_true', help='Run Monte Carlo simulations')
+    parser.add_argument('--periods', type=int, default=500, help='Number of periods to backtest')
+    args = parser.parse_args()
+
+    try: 
         if args.backtest or args.walkforward or args.montecarlo:
             # Fetch historical data for backtesting
             historical_data = data_fetcher.get_historical_data(
@@ -7281,17 +7368,24 @@ if __name__ == "__main__":
             
             sys.exit(0)  # Exit after backtesting
         
+        
         # Live trading mode
         if bot.initialize():
             try:
                 # Initialize trade counter
                 trade_count = 0
+                last_trailing_update = time.time() 
                 
                 # Main trading loop
                 while True:
                     try:
                         # Run one iteration of the trading logic
                         bot.run()
+
+                        # Update trailing stops every 60 seconds
+                        if time.time() - last_trailing_update >= 60:
+                            if bot._update_all_trailing_stops():
+                                last_trailing_update = time.time()  # Only update on success
                         
                         # Check for retraining every N trades (e.g., every 50 trades)
                         if trade_count % 50 == 0:  
@@ -7376,6 +7470,11 @@ if __name__ == "__main__":
             finally:
                 bot.mt5.disconnect()
                 logger.info("MT5 connection closed")
+
+    except Exception as e:
+        logger.error(f"Backtesting failed: {str(e)}", exc_info=True)
+        sys.exit(1)
+
 
 """J  
 Licensing Fee Models
